@@ -1,0 +1,13 @@
+node_modules/
+**/node_modules/
+dist/
+.env
+.env.*
+!.env.example
+
+backend/data/users.json
+backend/data/recordings.json
+backend/data/recordings/
+backend/data/*.sqlite
+backend/data/*.sqlite-shm
+backend/data/*.sqlite-wal
