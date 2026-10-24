@@ -82,6 +82,11 @@ That is the address both laptops use.
      **Stop recording** → the video appears under **Recordings** for any
      signed-in account;
    - Laptop 2 **Leave** → its tile disappears on laptop 1.
+   - Host: click the **link icon** next to the meeting code to copy an invite
+     link. Opening it on another laptop fills in the code automatically.
+   - **Attendance** and **Profile** pages on the home screen.
+   - A third account that did not join: **Recordings → Missed a meeting?** →
+     enter the meeting code → the recording appears and plays.
 
 If video does not connect (tile says "Video connection failed"), the network is
 blocking direct connections. Try a phone hotspot, or configure a TURN relay
@@ -94,27 +99,40 @@ via `http://localhost:5173`).
 
 | Feature | Status |
 |---|---|
-| Sign up / sign in (scrypt-hashed passwords, signed token) | Works — stored in `backend/data/users.json` (local file) |
-| Create / join meeting with a code | Works |
+| Sign up / sign in / sign out (scrypt-hashed passwords, signed token) | Works — `backend/data/users.json` |
+| Profile settings: change name, change password | Works |
+| Create meeting (server-generated unique code, optional title) | Works |
+| Join by code or **invite link** (`https://HOST_IP:5173/?room=CODE`) | Works; wrong codes show an error |
 | One tile per participant, names, initials when camera off, "Connecting…" status | Works |
-| Grid adjusts to number of people (1, 2, 3 columns) | Works |
+| Grid adjusts to number of people | Works |
 | Audio/video between laptops (WebRTC mesh, STUN) | Works on the same network; strict networks need TURN |
 | Mic / camera controls, status shown to others | Works |
 | People panel (count, host, mic/camera, connection) | Works |
-| Real-time chat | Works (not saved after the meeting) |
+| Real-time chat, saved with the meeting (late joiners see earlier messages) | Works — `backend/data/meetings.json` |
 | Screen sharing to everyone, stop sharing | Works |
 | Host-only recording, visible "being recorded" banner | Works (records in the host's browser) |
-| Recording library / playback for other users | Works — files stored on the backend laptop (`backend/data/recordings/`) |
-| Attendance history | Saved per browser only |
-| Google Cloud SQL (MySQL) | **Not implemented yet** |
+| Recording library: the host, everyone who attended, and anyone who enters the meeting code (e.g. students who missed the lecture) can watch; only the host can delete and see **who watched** (name and date) | Works — files in `backend/data/recordings/` |
+| Attendance history per account, on any device | Works — saved in `backend/data/meetings.json` |
+| Google Cloud SQL (MySQL) | **Not implemented yet** (JSON files use the same tables/fields) |
 | Google Cloud Storage for recordings | **Not implemented yet** |
 | Deployment to Google Compute Engine, SFU media server | **Not implemented yet** |
 
+### Where data is saved (local prototype)
+
+| File | Matches report table |
+|---|---|
+| `backend/data/users.json` | Users |
+| `backend/data/meetings.json` (meetings, `participants`, `viewers`, `messages`) | Meetings, Participants, Messages |
+| `backend/data/recordings.json` + `backend/data/recordings/*.webm` | Recordings (+ video files) |
+
+Recordings made before this update (without a saved meeting) stay visible to
+every signed-in user.
+
 Note: `better-sqlite3` is listed in `backend/package.json`, but the current
-server stores users in `users.json`, not SQLite.
+server stores data in JSON files, not SQLite.
 
 ## Security notes
 
 - Set a long random `TOKEN_SECRET` in `backend/.env` before any deployment.
-- Never commit `.env`, `backend/data/users.json` or the recordings folder.
+- Never commit `.env`, `backend/data/users.json`, `backend/data/meetings.json` or the recordings folder.
 - No cloud credentials are stored in this project.

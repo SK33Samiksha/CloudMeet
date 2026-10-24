@@ -3,7 +3,7 @@ import { io } from 'socket.io-client'
 import {
   Video, VideoOff, Mic, MicOff, MonitorUp, MessageCircle, Users,
   Copy, Plus, ArrowRight, PhoneOff, ShieldCheck, Cloud, X, Send,
-  Link2, Check, Sparkles, CalendarCheck, History, Clock, BarChart3, Circle, Square, Film, Play, Download, Trash2
+  Link2, Check, Sparkles, CalendarCheck, History, Clock, BarChart3, Circle, Square, Film, Play, Download, Trash2, UserRound, KeyRound
 } from 'lucide-react'
 
 // When these are empty, the browser uses the same address it opened
@@ -31,8 +31,20 @@ if (import.meta.env.VITE_TURN_URL) {
 }
 const iceConfig = { iceServers }
 
-function makeCode() {
-  return Math.random().toString(36).slice(2, 8).toUpperCase()
+function cleanMeetingCode(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12)
+}
+
+// Invite links look like https://HOST:5173/?room=AB12CD
+function inviteCodeFromUrl() {
+  try { return cleanMeetingCode(new URLSearchParams(window.location.search).get('room')) } catch { return '' }
+}
+
+function clearInviteFromUrl() {
+  try {
+    const url = new URL(window.location.href)
+    if (url.searchParams.has('room')) { url.searchParams.delete('room'); window.history.replaceState(null, '', url.pathname + url.search + url.hash) }
+  } catch {}
 }
 
 function initials(name) {
@@ -117,9 +129,28 @@ export default function App() {
   const recordingCanvasRef = useRef(null)
   const recordingAnimationRef = useRef(null)
   const recordingAudioContextRef = useRef(null)
-  const [attendance, setAttendance] = useState(() => { try { return JSON.parse(localStorage.getItem('cloudmeet-attendance') || '[]') } catch { return [] } })
+  const [attendance, setAttendance] = useState([])
+  const [attendanceError, setAttendanceError] = useState('')
+  const [recordingsError, setRecordingsError] = useState('')
+  const [recordingCode, setRecordingCode] = useState(inviteCodeFromUrl)
+  const [recordingCodeMessage, setRecordingCodeMessage] = useState('')
+  const [recordingCodeBusy, setRecordingCodeBusy] = useState(false)
+  const [viewersFor, setViewersFor] = useState(null)
+  const [viewersList, setViewersList] = useState(null)
+  const [viewersError, setViewersError] = useState('')
+  const [inviteRoom, setInviteRoom] = useState(inviteCodeFromUrl)
+  const [meetingTitle, setMeetingTitle] = useState('Team meeting')
+  const [newMeetingTitle, setNewMeetingTitle] = useState('')
+  const [meetingBusy, setMeetingBusy] = useState(false)
+  const [profileName, setProfileName] = useState('')
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [profileMessage, setProfileMessage] = useState('')
+  const [profileError, setProfileError] = useState('')
+  const [profileBusy, setProfileBusy] = useState(false)
   const meetingStartedAtRef = useRef(null)
-  const [meetingCode, setMeetingCode] = useState('')
+  const [meetingCode, setMeetingCode] = useState(inviteCodeFromUrl)
   const [name, setName] = useState(() => localStorage.getItem('cloudmeet-name') || '')
   const [room, setRoom] = useState('')
   const [joined, setJoined] = useState(false)
@@ -150,6 +181,11 @@ export default function App() {
   const selfIdRef = useRef(null)
   const participantsRef = useRef([])
   useEffect(() => { participantsRef.current = participants }, [participants])
+
+  // Opened an invite link? Scroll to the join card on the home screen.
+  useEffect(() => {
+    if (screen === 'home' && inviteRoom) setTimeout(() => document.getElementById('join-card')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 150)
+  }, [screen, inviteRoom])
 
   function flash(message, ms = 4000) {
     setNotice(message)
@@ -184,7 +220,39 @@ export default function App() {
   function emitJoin() {
     const info = joinInfoRef.current
     if (!info || !socketRef.current?.connected) return
-    socketRef.current.emit('join-room', { ...info, ...currentMediaState() })
+    // The token tells the server which account joined (for attendance and host rights).
+    socketRef.current.emit('join-room', { ...info, ...currentMediaState(), token: localStorage.getItem('cloudmeet-token') })
+  }
+
+  // Calls the backend with the sign-in token. Throws an Error with a
+  // readable message, and signs out automatically if the session expired.
+  async function apiFetch(path, { json, ...options } = {}) {
+    const token = localStorage.getItem('cloudmeet-token')
+    const headers = { ...(options.headers || {}) }
+    if (token) headers.Authorization = `Bearer ${token}`
+    if (json !== undefined) { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(json) }
+    let response
+    try { response = await fetch(`${API_URL}${path}`, { ...options, headers }) }
+    catch { throw new Error('Cannot reach the CloudMeet server. Check that the backend is running.') }
+    const data = await response.json().catch(() => ({}))
+    if (response.status === 401 && token) {
+      signOut(data.error || 'Your session has expired. Please sign in again.')
+      throw new Error(data.error || 'Please sign in again.')
+    }
+    if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`)
+    return data
+  }
+
+  // Leave the meeting screen without saving anything (used when joining fails).
+  function abortMeeting(message, mustSignOut = false) {
+    joinInfoRef.current = null
+    removeAllPeers()
+    streamRef.current?.getTracks().forEach(t => t.stop()); streamRef.current = null; setLocalStream(null)
+    screenStreamRef.current?.getTracks().forEach(t => t.stop()); screenStreamRef.current = null; setScreenStream(null)
+    setParticipants([]); setJoined(false); setIsHost(false); setRoomRecording(false)
+    if (mustSignOut) { signOut(message); return }
+    setScreen('home')
+    flash(message, 7000)
   }
 
   useEffect(() => {
@@ -203,8 +271,12 @@ export default function App() {
     socket.on('connect_error', err => setStatus(`Cannot reach meeting server (${err.message})`))
     socket.on('disconnect', () => setStatus('Disconnected — reconnecting…'))
     socket.on('chat-message', msg => setMessages(prev => [...prev, msg]))
+    // Earlier messages of this meeting, so late joiners can read them.
+    socket.on('chat-history', history => setMessages(Array.isArray(history) ? history : []))
+    socket.on('join-error', ({ error, signOut: mustSignOut } = {}) => abortMeeting(error || 'Could not join the meeting.', mustSignOut))
     socket.on('room-state', state => {
       if (state.selfId) selfIdRef.current = state.selfId
+      if (state.title) setMeetingTitle(state.title)
       setIsHost(Boolean(state.hostId) && state.hostId === selfIdRef.current)
       setRoomRecording(Boolean(state.recording))
     })
@@ -324,14 +396,15 @@ export default function App() {
   async function refreshRecordings() {
     let shared = []
     const token = localStorage.getItem('cloudmeet-token')
+    setRecordingsError('')
     if (token) {
       try {
-        const response = await fetch(`${API_URL}/api/recordings`, { headers: { Authorization: `Bearer ${token}` } })
-        if (response.ok) {
-          const data = await response.json()
-          shared = (data.recordings || []).map(item => ({ ...item, shared: true, url: `${API_URL}${item.url}?token=${encodeURIComponent(token)}` }))
-        }
-      } catch (err) { console.warn('Could not load shared recordings', err) }
+        const data = await apiFetch('/api/recordings')
+        shared = (data.recordings || []).map(item => ({ ...item, shared: true, url: `${API_URL}${item.url}?token=${encodeURIComponent(token)}` }))
+      } catch (err) {
+        console.warn('Could not load shared recordings', err)
+        setRecordingsError(`Could not load shared recordings: ${err.message}`)
+      }
     }
     try {
       const local = await getRecordings()
@@ -362,13 +435,77 @@ export default function App() {
     } finally { setAuthBusy(false) }
   }
 
-  function signOut() {
+  function signOut(message = '') {
     localStorage.removeItem('cloudmeet-token')
     localStorage.removeItem('cloudmeet-user')
     setCurrentUser(null)
     setAuthMode('login')
     setAuthPassword('')
+    setAuthError(typeof message === 'string' ? message : '')
     setScreen('auth')
+  }
+
+  // A student who missed the meeting enters its code to see its recordings.
+  async function unlockRecordings(e, codeOverride) {
+    e?.preventDefault?.()
+    const code = cleanMeetingCode(codeOverride || recordingCode)
+    setRecordingCodeMessage(''); setRecordingsError('')
+    if (!code) { setRecordingsError('Enter the meeting code your host shared.'); return }
+    setRecordingCodeBusy(true)
+    try {
+      const data = await apiFetch('/api/recordings/access', { method: 'POST', json: { code } })
+      await refreshRecordings()
+      setRecordingCode('')
+      setRecordingCodeMessage(data.recordingCount
+        ? `Added "${data.meeting.title}" (${data.meeting.id}) by ${data.meeting.hostName}: ${data.recordingCount} recording${data.recordingCount > 1 ? 's' : ''} now in your library.`
+        : `"${data.meeting.title}" (${data.meeting.id}) has no recording yet. It will appear here automatically once the host records it.`)
+    } catch (err) { setRecordingsError(err.message) } finally { setRecordingCodeBusy(false) }
+  }
+
+  function openMissedRecording(code) {
+    clearInviteFromUrl(); setInviteRoom('')
+    setScreen('recordings')
+    unlockRecordings(null, code)
+  }
+
+  async function loadAttendance() {
+    setAttendanceError('')
+    try {
+      const data = await apiFetch('/api/attendance')
+      setAttendance(data.attendance || [])
+    } catch (err) { setAttendanceError(err.message) }
+  }
+
+  function openProfile() {
+    setProfileName(currentUser?.name || name || '')
+    setCurrentPassword(''); setNewPassword(''); setConfirmPassword('')
+    setProfileMessage(''); setProfileError('')
+    setScreen('profile')
+  }
+
+  async function saveProfileName(e) {
+    e.preventDefault()
+    setProfileMessage(''); setProfileError(''); setProfileBusy(true)
+    try {
+      const data = await apiFetch('/api/auth/profile', { method: 'PUT', json: { name: profileName } })
+      localStorage.setItem('cloudmeet-token', data.token)
+      localStorage.setItem('cloudmeet-user', JSON.stringify(data.user))
+      localStorage.setItem('cloudmeet-name', data.user.name)
+      setCurrentUser(data.user); setName(data.user.name)
+      setProfileMessage('Your name has been updated.')
+    } catch (err) { setProfileError(err.message) } finally { setProfileBusy(false) }
+  }
+
+  async function savePassword(e) {
+    e.preventDefault()
+    setProfileMessage(''); setProfileError('')
+    if (newPassword !== confirmPassword) { setProfileError('The new passwords do not match.'); return }
+    setProfileBusy(true)
+    try {
+      await apiFetch('/api/auth/password', { method: 'PUT', json: { currentPassword, newPassword } })
+      setCurrentPassword(''); setNewPassword(''); setConfirmPassword('')
+      setProfileMessage('Your password has been changed.')
+    } catch (err) { setProfileError(err.message) } finally { setProfileBusy(false) }
   }
 
   async function startRecording() {
@@ -432,14 +569,14 @@ export default function App() {
         try {
           const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || 'video/webm' })
           if (blob.size) {
-            const item = { id: `${Date.now()}-${room}`, title: `Meeting ${room}`, room, createdAt: Date.now(), durationSeconds: Math.max(1, Math.round((Date.now() - (recorder.startedAt || Date.now())) / 1000)), blob }
+            const item = { id: `${Date.now()}-${room}`, title: meetingTitle || `Meeting ${room}`, room, createdAt: Date.now(), durationSeconds: Math.max(1, Math.round((Date.now() - (recorder.startedAt || Date.now())) / 1000)), blob }
             await saveRecording(item)
             const token = localStorage.getItem('cloudmeet-token')
             if (token) {
               try {
                 // The backend (multer) expects a multipart form with a "video" file field.
                 const form = new FormData()
-                form.append('title', `Meeting ${room}`)
+                form.append('title', item.title)
                 form.append('room', room)
                 form.append('durationSeconds', String(item.durationSeconds))
                 form.append('video', new File([blob], `cloudmeet-${room}.webm`, { type: 'video/webm' }))
@@ -449,7 +586,7 @@ export default function App() {
                 // Uploaded copy is now in the shared library; remove the duplicate browser copy.
                 await deleteRecording(item.id).catch(() => {})
                 await refreshRecordings()
-                setNotice('Recording uploaded to the shared library. Signed-in users can watch it later.')
+                setNotice('Recording saved. Everyone who attended this meeting can watch it under Recordings.')
               } catch (uploadError) {
                 console.error('Shared recording upload failed:', uploadError)
                 await refreshRecordings()
@@ -492,23 +629,57 @@ export default function App() {
   async function openRecording(item) {
     if (recordingUrl) URL.revokeObjectURL(recordingUrl)
     setRecordingUrl(item.url ? item.url : URL.createObjectURL(item.blob))
+    // Tell the server this person watched it (the host sees the list).
+    if (item.shared) apiFetch(`/api/recordings/${encodeURIComponent(item.id)}/view`, { method: 'POST' }).catch(err => console.warn('View not saved:', err.message))
+  }
+
+  // Host only: show who watched a recording (name and date).
+  async function toggleViewers(item) {
+    if (viewersFor === item.id) { setViewersFor(null); return }
+    setViewersFor(item.id); setViewersList(null); setViewersError('')
+    try {
+      const data = await apiFetch(`/api/recordings/${encodeURIComponent(item.id)}/viewers`)
+      setViewersList(data.viewers || [])
+    } catch (err) { setViewersError(err.message) }
   }
 
   async function removeRecording(id) {
     if (!window.confirm('Delete this recording?')) return
     try {
       const item = recordings.find(record => record.id === id)
-      if (item?.shared) {
-        const response = await fetch(`${API_URL}/api/recordings/${encodeURIComponent(id)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${localStorage.getItem('cloudmeet-token')}` } })
-        const data = await response.json().catch(() => ({}))
-        if (!response.ok) throw new Error(data.error || 'Delete failed')
-      } else await deleteRecording(id)
+      if (item?.shared) await apiFetch(`/api/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      else await deleteRecording(id)
       if (recordingUrl) { URL.revokeObjectURL(recordingUrl); setRecordingUrl('') }
       await refreshRecordings()
-    } catch { setNotice('Could not delete this recording.') }
+    } catch (err) { setRecordingsError(`Could not delete this recording: ${err.message}`) }
   }
 
   async function startMeeting(code, host = false) {
+    if (meetingBusy) return
+    // 1. Ask the server to create the meeting (host), or check the code (join).
+    let finalCode, title
+    setMeetingBusy(true)
+    try {
+      if (host) {
+        const data = await apiFetch('/api/meetings', { method: 'POST', json: { title: newMeetingTitle } })
+        finalCode = data.meeting.id; title = data.meeting.title
+      } else {
+        const wanted = cleanMeetingCode(code)
+        if (!wanted) throw new Error('Please enter a meeting code first.')
+        const data = await apiFetch(`/api/meetings/${wanted}`)
+        finalCode = data.meeting.id; title = data.meeting.title
+      }
+    } catch (err) {
+      flash(err.message, 6000)
+      setMeetingBusy(false)
+      return
+    }
+    setMeetingBusy(false)
+    clearInviteFromUrl(); setInviteRoom('')
+    setMeetingTitle(title || 'Team meeting')
+    setNewMeetingTitle('')
+
+    // 2. Start camera/microphone, then join the live room.
     setIsHost(false) // confirmed by the server in 'room-state'
     setRoomRecording(false)
     setParticipants([])
@@ -516,7 +687,6 @@ export default function App() {
     const cleanName = name.trim() || 'Guest'
     setName(cleanName)
     localStorage.setItem('cloudmeet-name', cleanName)
-    const finalCode = (code || makeCode()).trim().toUpperCase()
     setRoom(finalCode)
     meetingStartedAtRef.current = Date.now()
     setMeetingCode(finalCode)
@@ -640,8 +810,16 @@ export default function App() {
   async function copyCode() {
     try {
       await navigator.clipboard.writeText(room)
-      setCopied(true); setTimeout(() => setCopied(false), 1600)
-    } catch { setNotice(`Meeting code: ${room}`); setTimeout(() => setNotice(''), 4000) }
+      setCopied('code'); setTimeout(() => setCopied(false), 1600)
+    } catch { flash(`Meeting code: ${room}`) }
+  }
+  async function copyInviteLink() {
+    const link = `${window.location.origin}/?room=${room}`
+    try {
+      await navigator.clipboard.writeText(link)
+      setCopied('link'); setTimeout(() => setCopied(false), 1600)
+      flash('Invite link copied. Send it to participants on the same network.', 3500)
+    } catch { flash(`Invite link: ${link}`, 8000) }
   }
   function leaveMeeting() {
     if (recorderRef.current && recorderRef.current.state !== 'inactive') {
@@ -654,13 +832,9 @@ export default function App() {
   }
 
   function finishLeaveMeeting() {
+    // The server records the leave time for attendance.
     socketRef.current?.emit('leave-room', { room })
-    if (meetingStartedAtRef.current) {
-      const endedAt = Date.now()
-      const record = { id: `${endedAt}-${room}`, name: name || 'Guest', room, joinedAt: meetingStartedAtRef.current, leftAt: endedAt, durationMinutes: Math.max(1, Math.round((endedAt - meetingStartedAtRef.current) / 60000)) }
-      setAttendance(prev => { const next = [record, ...prev].slice(0, 100); localStorage.setItem('cloudmeet-attendance', JSON.stringify(next)); return next })
-      meetingStartedAtRef.current = null
-    }
+    meetingStartedAtRef.current = null
     joinInfoRef.current = null
     removeAllPeers()
     streamRef.current?.getTracks().forEach(t => t.stop()); streamRef.current = null; setLocalStream(null)
@@ -677,6 +851,7 @@ export default function App() {
     </div>
     <div className="auth-main"><form className="auth-card" onSubmit={submitAuth}>
       <span className="eyebrow">WELCOME TO CLOUDMEET</span><h2>{authMode === 'signup' ? 'Create your account' : 'Welcome back'}</h2><p className="auth-subtitle">{authMode === 'signup' ? 'Sign up to start joining and hosting meetings.' : 'Sign in to continue to your meetings.'}</p>
+      {inviteRoom && <div className="invite-hint"><Link2 size={15}/> Sign in to join meeting <b>{inviteRoom}</b>.</div>}
       {authError && <div className="auth-error" role="alert">{authError}</div>}
       {authMode === 'signup' && <label className="auth-label">Full name<input autoComplete="name" value={authName} onChange={e => setAuthName(e.target.value)} placeholder="Enter your name" minLength={2} maxLength={80} required /></label>}
       <label className="auth-label">Email address<input type="email" autoComplete="email" value={authEmail} onChange={e => setAuthEmail(e.target.value)} placeholder="you@example.com" required /></label>
@@ -709,13 +884,13 @@ export default function App() {
     return <div className="meeting-app">
       <header className="meeting-header">
         <a className="brand compact" href="#" onClick={e => { e.preventDefault(); leaveMeeting() }}><span className="brand-icon"><Video size={19}/></span><span>Cloud<span className="brand-blue">Meet</span></span></a>
-        <div className="room-info"><span className="live-dot" /> Meeting <b>{room}</b><button className="icon-button small" onClick={copyCode} title="Copy meeting code">{copied ? <Check size={15}/> : <Copy size={15}/>}</button></div>
+        <div className="room-info"><span className="live-dot" /> Meeting <b>{room}</b><button className="icon-button small" onClick={copyCode} title="Copy meeting code">{copied === 'code' ? <Check size={15}/> : <Copy size={15}/>}</button><button className="icon-button small" onClick={copyInviteLink} title="Copy invite link">{copied === 'link' ? <Check size={15}/> : <Link2 size={15}/>}</button></div>
         <div className="header-right"><span className="connection-status">{status}</span><span className="people-count"><Users size={16}/>{participants.length + 1}</span></div>
       </header>
       {notice && <div className="toast">{notice}</div>}
       <main className={`meeting-main ${chatOpen ? 'with-chat' : ''}`}>
         <section className="video-stage">
-          <div className="stage-topline"><div><span className="eyebrow">LIVE SESSION</span><h1>Team meeting</h1></div><div className="stage-badges"><span className="secure-badge"><ShieldCheck size={14}/> Private room code</span><span className="secure-badge"><Users size={14}/>{participants.length + 1} participant{participants.length ? 's' : ''}</span></div></div>
+          <div className="stage-topline"><div><span className="eyebrow">LIVE SESSION</span><h1>{meetingTitle}</h1></div><div className="stage-badges"><span className="secure-badge"><ShieldCheck size={14}/> Private room code</span><span className="secure-badge"><Users size={14}/>{participants.length + 1} participant{participants.length ? 's' : ''}</span></div></div>
           <section aria-label="Meeting participants" style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap',padding:'10px 12px',margin:'0 0 12px',border:'1px solid #e5e7eb',borderRadius:12,background:'#fff'}}>
             <button type="button" onClick={() => setPeopleOpen(v => !v)} aria-expanded={peopleOpen} style={{border:0,background:'transparent',fontWeight:700,fontSize:13,color:'#374151',cursor:'pointer',padding:'5px 0'}}>People ({participants.length + 1})</button>
             <span style={{display:'inline-flex',alignItems:'center',gap:7,padding:'6px 10px',borderRadius:999,background:'#eff6ff',color:'#1d4ed8',fontSize:13}}>
@@ -750,7 +925,7 @@ export default function App() {
                 status={tileStatus(person.id, stream)}
               />
             })}
-            {participants.length === 0 && <div className="empty-tile"><div className="empty-icon"><Users size={27}/></div><h3>Waiting for others to join</h3><p>Share the meeting code so your team can join.</p><button className="button button-light" onClick={copyCode}><Copy size={15}/>{copied ? 'Copied!' : 'Copy meeting code'}</button></div>}
+            {participants.length === 0 && <div className="empty-tile"><div className="empty-icon"><Users size={27}/></div><h3>Waiting for others to join</h3><p>Share the invite link or meeting code so your team can join.</p><div className="empty-actions"><button className="button button-primary" onClick={copyInviteLink}><Link2 size={15}/>{copied === 'link' ? 'Copied!' : 'Copy invite link'}</button><button className="button button-light" onClick={copyCode}><Copy size={15}/>{copied === 'code' ? 'Copied!' : 'Copy code'}</button></div></div>}
           </div>
           <div className="control-dock">
             <div className="control-group">
@@ -793,14 +968,15 @@ export default function App() {
     <main className="attendance-page">
       <div className="attendance-heading"><span className="eyebrow">YOUR ACTIVITY</span><h1>Attendance dashboard</h1><p>Review your CloudMeet sessions and the time you spent in meetings.</p></div>
       <div className="attendance-stats" id="attendance-summary">
-        <article className="attendance-stat"><span className="attendance-stat-icon"><CalendarCheck size={20}/></span><p>Meetings attended</p><strong>{uniqueMeetings}</strong><small>Sessions recorded on this browser</small></article>
+        <article className="attendance-stat"><span className="attendance-stat-icon"><CalendarCheck size={20}/></span><p>Meetings attended</p><strong>{uniqueMeetings}</strong><small>Saved on the CloudMeet server for your account</small></article>
         <article className="attendance-stat"><span className="attendance-stat-icon violet"><Clock size={20}/></span><p>Total time in meetings</p><strong>{totalMinutes} <em>min</em></strong><small>Based on join and leave time</small></article>
         <article className="attendance-stat"><span className="attendance-stat-icon teal"><BarChart3 size={20}/></span><p>Average session</p><strong>{uniqueMeetings ? Math.round(totalMinutes / uniqueMeetings) : 0} <em>min</em></strong><small>Across your recorded sessions</small></article>
       </div>
-      <section className="attendance-history" id="attendance-history"><div className="attendance-history-title"><div><span className="eyebrow">RECENT ACTIVITY</span><h2>Meeting history</h2></div><button className="button button-outline" onClick={() => { setAttendance([]); localStorage.removeItem('cloudmeet-attendance') }} disabled={!attendance.length}>Clear history</button></div>
-        {attendance.length ? <div className="attendance-table-wrap"><table className="attendance-table"><thead><tr><th>Participant</th><th>Meeting code</th><th>Date</th><th>Joined</th><th>Duration</th><th>Status</th></tr></thead><tbody>{attendance.map(item => <tr key={item.id}><td><b>{item.name}</b></td><td><span className="meeting-code-pill">{item.room}</span></td><td>{new Date(item.joinedAt).toLocaleDateString()}</td><td>{new Date(item.joinedAt).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</td><td>{item.durationMinutes} min</td><td><span className="attendance-present">Recorded</span></td></tr>)}</tbody></table></div> : <div className="attendance-empty"><History size={30}/><h3>No attendance records yet</h3><p>Join or create a meeting, then leave it to see your session here.</p><button className="button button-primary" onClick={() => { setScreen('home'); setTimeout(() => document.getElementById('start-panel')?.scrollIntoView({behavior:'smooth'}), 0) }}>Start a meeting <ArrowRight size={16}/></button></div>}
+      <section className="attendance-history" id="attendance-history"><div className="attendance-history-title"><div><span className="eyebrow">RECENT ACTIVITY</span><h2>Meeting history</h2></div><button className="button button-outline" onClick={loadAttendance}><History size={16}/> Refresh</button></div>
+        {attendanceError && <div className="auth-error page-error" role="alert">{attendanceError}</div>}
+        {attendance.length ? <div className="attendance-table-wrap"><table className="attendance-table"><thead><tr><th>Meeting</th><th>Code</th><th>Your name</th><th>Role</th><th>Date</th><th>Joined</th><th>Duration</th><th>People</th></tr></thead><tbody>{attendance.map(item => <tr key={item.id}><td><b>{item.title}</b></td><td><span className="meeting-code-pill">{item.room}</span></td><td>{item.name}</td><td>{item.role}</td><td>{new Date(item.joinedAt).toLocaleDateString()}</td><td>{new Date(item.joinedAt).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</td><td>{item.leftAt ? `${item.durationMinutes} min` : <span className="attendance-present">In progress</span>}</td><td>{item.participantCount}</td></tr>)}</tbody></table></div> : <div className="attendance-empty"><History size={30}/><h3>No attendance records yet</h3><p>Join or create a meeting, then leave it to see your session here.</p><button className="button button-primary" onClick={() => { setScreen('home'); setTimeout(() => document.getElementById('start-panel')?.scrollIntoView({behavior:'smooth'}), 0) }}>Start a meeting <ArrowRight size={16}/></button></div>}
       </section>
-      <p className="attendance-disclaimer">Prototype note: records are saved in this browser only. This version tracks your own meeting sessions; organization-wide attendance reports and administrator access require a shared database and user accounts.</p>
+      <p className="attendance-disclaimer">Attendance is saved by the CloudMeet backend each time you join or leave a meeting, so you see the same history on any device. In the cloud version this data moves to Cloud SQL (MySQL).</p>
     </main>
   </div>
 
@@ -811,12 +987,52 @@ export default function App() {
       <button className="button button-outline" onClick={() => setScreen('home')}><ArrowRight size={16}/> Back to meetings</button>
     </header>
     <main className="attendance-page recordings-page">
-      <div className="attendance-heading"><span className="eyebrow">MEETING LIBRARY</span><h1>Recordings</h1><p>Play shared class recordings, including sessions you missed.</p></div>
+      <div className="attendance-heading"><span className="eyebrow">MEETING LIBRARY</span><h1>Recordings</h1><p>Recordings of meetings you hosted or attended, and of meetings you added with a code.</p></div>
+      <form className="attendance-history missed-form" onSubmit={unlockRecordings}>
+        <div><span className="eyebrow">MISSED A MEETING?</span><h2>Find a recording with the meeting code</h2><p>Enter the code (or open the invite link) your host shared. The recording is added to your library.</p></div>
+        <div className="missed-input"><input value={recordingCode} onChange={e => setRecordingCode(cleanMeetingCode(e.target.value))} placeholder="e.g. A1B2C3" maxLength={12} aria-label="Meeting code"/><button className="button button-primary" type="submit" disabled={recordingCodeBusy}>{recordingCodeBusy ? 'Checking…' : 'Find recording'}</button></div>
+      </form>
+      {recordingCodeMessage && <div className="profile-success" role="status"><Check size={16}/> {recordingCodeMessage}</div>}
+      {recordingsError && <div className="auth-error page-error" role="alert">{recordingsError}</div>}
       {recordingUrl && <section className="recording-player"><div className="attendance-history-title"><h2>Preview recording</h2><button className="button button-outline" onClick={() => { URL.revokeObjectURL(recordingUrl); setRecordingUrl('') }}>Close player</button></div><video controls autoPlay src={recordingUrl}/></section>}
       <section className="attendance-history" id="recording-list"><div className="attendance-history-title"><div><span className="eyebrow">SHARED LIBRARY</span><h2>Class recordings</h2></div><button className="button button-outline" onClick={refreshRecordings}><History size={16}/> Refresh</button></div>
-      {recordings.length ? <div className="recording-grid">{recordings.map(item => <article className="recording-card" key={item.id}><div className="recording-thumb"><Film size={34}/><span>WEBM VIDEO</span></div><div className="recording-card-body"><h3>{item.title || `Meeting ${item.room}`}</h3><p>Room {item.room} · {new Date(item.createdAt).toLocaleString()}</p><p>{Math.floor((item.durationSeconds || 0) / 60)}m {(item.durationSeconds || 0) % 60}s · {((item.sizeBytes || item.blob?.size || 0) / (1024 * 1024)).toFixed(1)} MB</p><div className="recording-actions"><button className="button button-primary" onClick={() => openRecording(item)}><Play size={15}/> Play</button><a className="button button-outline" href={item.url ? item.url : URL.createObjectURL(item.blob)} download={`CloudMeet-${item.room}-${item.createdAt}.webm`}><Download size={15}/> Download</a><button className="icon-button delete-recording" onClick={() => removeRecording(item.id)} title="Delete recording"><Trash2 size={17}/></button></div></div></article>)}</div> : <div className="attendance-empty"><Film size={32}/><h3>No recordings yet</h3><p>Join a meeting, click Record, then stop recording or leave the meeting. Your video will appear here.</p><button className="button button-primary" onClick={() => setScreen('home')}>Go to meetings <ArrowRight size={16}/></button></div>}
+      {recordings.length ? <div className="recording-grid">{recordings.map(item => <article className="recording-card" key={item.id}><div className="recording-thumb"><Film size={34}/><span>WEBM VIDEO</span></div><div className="recording-card-body"><h3>{item.title || `Meeting ${item.room}`}</h3><p>Room {item.room} · {new Date(item.createdAt).toLocaleString()}{item.hostName ? ` · by ${item.hostName}` : ''}{!item.shared ? ' · only in this browser' : ''}</p><p>{Math.floor((item.durationSeconds || 0) / 60)}m {(item.durationSeconds || 0) % 60}s · {((item.sizeBytes || item.blob?.size || 0) / (1024 * 1024)).toFixed(1)} MB</p><div className="recording-actions"><button className="button button-primary" onClick={() => openRecording(item)}><Play size={15}/> Play</button><a className="button button-outline" href={item.url ? item.url : URL.createObjectURL(item.blob)} download={`CloudMeet-${item.room}-${item.createdAt}.webm`}><Download size={15}/> Download</a>{item.shared && item.hostId === currentUser?.id && <button className={`button button-outline ${viewersFor === item.id ? 'viewers-open' : ''}`} onClick={() => toggleViewers(item)}><Users size={15}/> Viewers ({item.viewCount || 0})</button>}{(!item.shared || item.hostId === currentUser?.id) && <button className="icon-button delete-recording" onClick={() => removeRecording(item.id)} title="Delete recording"><Trash2 size={17}/></button>}</div>{viewersFor === item.id && <div className="viewers-list">
+        <b>Who watched this recording</b>
+        {viewersError ? <p className="viewers-error">{viewersError}</p>
+          : !viewersList ? <p>Loading…</p>
+          : viewersList.length === 0 ? <p>Nobody has watched it yet.</p>
+          : <ul>{viewersList.map(v => <li key={v.name + v.watchedAt}><span>{v.name}</span><span>{new Date(v.watchedAt).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' })}</span></li>)}</ul>}
+      </div>}</div></article>)}</div> : <div className="attendance-empty"><Film size={32}/><h3>No recordings yet</h3><p>Join a meeting, click Record, then stop recording or leave the meeting. Your video will appear here.</p><button className="button button-primary" onClick={() => setScreen('home')}>Go to meetings <ArrowRight size={16}/></button></div>}
       </section>
-      <p className="attendance-disclaimer">Shared recordings are stored on the CloudMeet backend server so signed-in users can watch them from another browser. For deployment across computers, use durable cloud object storage such as Google Cloud Storage. Make sure participants know when recording is active.</p>
+      <p className="attendance-disclaimer">Recordings are stored by the CloudMeet backend. They can be watched by the host, by everyone who attended, and by anyone who enters the meeting code here. Only the host can delete a recording. In the cloud version the video files move to Google Cloud Storage.</p>
+    </main>
+  </div>
+
+  if (screen === 'profile') return <div className="home-app">
+    <header className="site-header">
+      <a className="brand" href="#" onClick={e => { e.preventDefault(); setScreen('home') }}><span className="brand-icon"><Video size={20}/></span><span>Cloud<span className="brand-blue">Meet</span></span></a>
+      <nav><a href="#profile-details">Profile</a><a href="#profile-password">Password</a></nav>
+      <button className="button button-outline" onClick={() => setScreen('home')}><ArrowRight size={16}/> Back to meetings</button>
+    </header>
+    <main className="attendance-page profile-page">
+      <div className="attendance-heading"><span className="eyebrow">YOUR ACCOUNT</span><h1>Profile settings</h1><p>Update the name others see in meetings, or change your password.</p></div>
+      {profileMessage && <div className="profile-success" role="status"><Check size={16}/> {profileMessage}</div>}
+      {profileError && <div className="auth-error page-error" role="alert">{profileError}</div>}
+      <div className="profile-grid">
+        <form className="attendance-history profile-card" id="profile-details" onSubmit={saveProfileName}>
+          <div className="profile-card-title"><span className="attendance-stat-icon"><UserRound size={20}/></span><h2>Profile</h2></div>
+          <label className="auth-label">Email address<input value={currentUser?.email || ''} disabled /></label>
+          <label className="auth-label">Full name<input value={profileName} onChange={e => setProfileName(e.target.value)} minLength={2} maxLength={80} required /></label>
+          <button className="button button-primary" type="submit" disabled={profileBusy}>{profileBusy ? 'Saving…' : 'Save name'}</button>
+        </form>
+        <form className="attendance-history profile-card" id="profile-password" onSubmit={savePassword}>
+          <div className="profile-card-title"><span className="attendance-stat-icon violet"><KeyRound size={20}/></span><h2>Change password</h2></div>
+          <label className="auth-label">Current password<input type="password" autoComplete="current-password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} required /></label>
+          <label className="auth-label">New password<input type="password" autoComplete="new-password" value={newPassword} onChange={e => setNewPassword(e.target.value)} minLength={8} placeholder="At least 8 characters" required /></label>
+          <label className="auth-label">Confirm new password<input type="password" autoComplete="new-password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} minLength={8} required /></label>
+          <button className="button button-primary" type="submit" disabled={profileBusy}>{profileBusy ? 'Saving…' : 'Change password'}</button>
+        </form>
+      </div>
     </main>
   </div>
 
@@ -834,13 +1050,16 @@ export default function App() {
 
       <div className="header-actions">
         <span className="signed-in-label">Hi, {currentUser?.name || name || 'User'}</span>
-        <button className="button button-outline" onClick={() => setScreen('attendance')}>
+        <button className="button button-outline" onClick={() => { loadAttendance(); setScreen('attendance') }}>
           <CalendarCheck size={16}/> <span>Attendance</span>
         </button>
         <button className="button button-outline" onClick={() => { refreshRecordings(); setScreen('recordings') }}>
           <Film size={16}/> <span>Recordings</span>
         </button>
-        <button className="button button-outline sign-out-button" onClick={signOut}>Sign out</button>
+        <button className="button button-outline" onClick={openProfile}>
+          <UserRound size={16}/> <span>Profile</span>
+        </button>
+        <button className="button button-outline sign-out-button" onClick={() => signOut()}>Sign out</button>
         <button className="button button-primary launch-button" onClick={() => { setScreen('start'); document.getElementById('start-panel')?.scrollIntoView({behavior:'smooth'}) }}>
           Launch app <ArrowRight size={16}/>
         </button>
@@ -870,14 +1089,14 @@ export default function App() {
       <section className="start-section" id="start-panel">
         <div className="section-heading"><span className="eyebrow">GET STARTED</span><h2>Your next meeting starts here.</h2><p>Create a new room or join your team's existing meeting.</p></div>
         <div className="start-grid">
-          <div className="start-card create-card"><div className="card-icon blue"><Plus size={22}/></div><h3>Create a meeting</h3><p>Start a new room and invite people with a meeting code.</p><label>Your display name</label><input value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name" maxLength={32}/><button className="button button-primary full" onClick={() => startMeeting(makeCode(), true)}><Video size={17}/> Create meeting <ArrowRight size={16}/></button></div>
-          <div className="start-card join-card"><div className="card-icon purple"><Link2 size={21}/></div><h3>Join a meeting</h3><p>Have a code? Enter it below to join your team.</p><label>Your display name</label><input value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name" maxLength={32}/><label>Meeting code</label><input value={meetingCode} onChange={e => setMeetingCode(e.target.value.toUpperCase())} placeholder="e.g. A1B2C3" maxLength={12}/><button className="button button-dark full" onClick={() => meetingCode.trim() ? startMeeting(meetingCode, false) : setNotice('Please enter a meeting code first.')}><ArrowRight size={17}/> Join meeting</button></div>
+          <div className="start-card create-card"><div className="card-icon blue"><Plus size={22}/></div><h3>Create a meeting</h3><p>Start a new room and invite people with a meeting code.</p><label>Meeting title (optional)</label><input value={newMeetingTitle} onChange={e => setNewMeetingTitle(e.target.value)} placeholder="e.g. Cloud Lab review" maxLength={80}/><label>Your display name</label><input value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name" maxLength={32}/><button className="button button-primary full" disabled={meetingBusy} onClick={() => startMeeting('', true)}><Video size={17}/> {meetingBusy ? 'Please wait…' : 'Create meeting'} <ArrowRight size={16}/></button></div>
+          <div className={`start-card join-card ${inviteRoom ? 'invited' : ''}`} id="join-card"><div className="card-icon purple"><Link2 size={21}/></div><h3>Join a meeting</h3><p>{inviteRoom ? <>You were invited to meeting <b>{inviteRoom}</b>. Check your name and click Join.</> : 'Have a code or invite link? Enter the code below to join your team.'}</p><label>Your display name</label><input value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name" maxLength={32}/><label>Meeting code</label><input value={meetingCode} onChange={e => setMeetingCode(cleanMeetingCode(e.target.value))} placeholder="e.g. A1B2C3" maxLength={12}/><button className="button button-dark full" disabled={meetingBusy} onClick={() => startMeeting(meetingCode, false)}><ArrowRight size={17}/> {meetingBusy ? 'Checking…' : 'Join meeting'}</button>{inviteRoom && <button type="button" className="missed-link" onClick={() => openMissedRecording(inviteRoom)}><Film size={14}/> Missed this meeting? Watch its recording</button>}</div>
         </div>
         {notice && <div className="home-notice">{notice}<button onClick={() => setNotice('')}><X size={15}/></button></div>}
         <div className="status-note"><span className="status-dot"/>{status}</div>
       </section>
 
-      <section className="attendance-promo"><div className="promo-icon"><CalendarCheck size={24}/></div><div><span className="eyebrow">NEW IN CLOUDMEET</span><h2>Keep track of your meetings.</h2><p>Review your past sessions, meeting duration, and personal attendance history.</p></div><button className="button button-primary" onClick={() => setScreen('attendance')}>View attendance <ArrowRight size={16}/></button></section>
+      <section className="attendance-promo"><div className="promo-icon"><CalendarCheck size={24}/></div><div><span className="eyebrow">NEW IN CLOUDMEET</span><h2>Keep track of your meetings.</h2><p>Review your past sessions, meeting duration, and personal attendance history.</p></div><button className="button button-primary" onClick={() => { loadAttendance(); setScreen('attendance') }}>View attendance <ArrowRight size={16}/></button></section>
       <section className="attendance-promo recording-promo"><div className="promo-icon"><Film size={24}/></div><div><span className="eyebrow">MEETING LIBRARY</span><h2>Save and replay meetings.</h2><p>Record a session, then play or download the saved video from your browser.</p></div><button className="button button-primary" onClick={() => { refreshRecordings(); setScreen('recordings') }}>View recordings <ArrowRight size={16}/></button></section>
       <section className="features-section" id="features"><div className="section-heading"><span className="eyebrow">BUILT FOR CONNECTION</span><h2>Everything you need to get together.</h2><p>Simple tools that help conversations flow.</p></div><div className="feature-grid"><article className="feature-card"><div className="feature-icon"><Video size={21}/></div><h3>Video that brings you closer</h3><p>Connect face-to-face with browser-based audio and video calling.</p></article><article className="feature-card"><div className="feature-icon violet"><MessageCircle size={21}/></div><h3>Chat as you collaborate</h3><p>Send messages to everyone in the meeting room.</p></article><article className="feature-card"><div className="feature-icon teal"><ShieldCheck size={21}/></div><h3>Your room, your team</h3><p>Join using a room code and keep conversations organized.</p></article></div></section>
       <section className="about-section" id="about"><div className="about-mark"><Video size={25}/></div><div><span className="eyebrow">ABOUT CLOUDMEET</span><h2>Connect. Collaborate. Anywhere.</h2><p>CloudMeet is a college project prototype exploring real-time communication and cloud deployment technologies.</p></div></section>
