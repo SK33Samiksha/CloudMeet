@@ -6,24 +6,57 @@ import {
   Link2, Check, Sparkles, CalendarCheck, History, Clock, BarChart3, Circle, Square, Film, Play, Download, Trash2
 } from 'lucide-react'
 
-const SIGNALING_URL = import.meta.env.VITE_SIGNALING_URL || 'http://localhost:5000'
-const API_URL = import.meta.env.VITE_API_URL || SIGNALING_URL
-const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+// When these are empty, the browser uses the same address it opened
+// (for example https://192.168.1.5:5173) and Vite forwards /api and
+// /socket.io to the backend. See vite.config.js.
+// An https page may not call an http:// backend (the browser blocks it as
+// "mixed content"), so an old http:// value in .env is ignored on https.
+function backendUrl(value) {
+  if (!value) return ''
+  if (window.location.protocol === 'https:' && value.startsWith('http:')) return ''
+  return value.replace(/\/$/, '')
+}
+const SIGNALING_URL = backendUrl(import.meta.env.VITE_SIGNALING_URL) || undefined
+const API_URL = backendUrl(import.meta.env.VITE_API_URL || import.meta.env.VITE_SIGNALING_URL)
+
+// STUN helps each laptop discover its public address. A TURN relay is only
+// needed on strict networks; it is read from .env so no secret is hard-coded.
+const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }]
+if (import.meta.env.VITE_TURN_URL) {
+  iceServers.push({
+    urls: import.meta.env.VITE_TURN_URL,
+    username: import.meta.env.VITE_TURN_USERNAME || undefined,
+    credential: import.meta.env.VITE_TURN_CREDENTIAL || undefined
+  })
+}
+const iceConfig = { iceServers }
 
 function makeCode() {
   return Math.random().toString(36).slice(2, 8).toUpperCase()
 }
 
-function VideoTile({ stream, name, muted = false, isLocal = false, cameraOff = false }) {
+function initials(name) {
+  const parts = String(name || '?').trim().split(/\s+/).filter(Boolean)
+  return ((parts[0]?.[0] || '?') + (parts.length > 1 ? parts[parts.length - 1][0] : '')).toUpperCase()
+}
+
+// One tile per participant. The tile is shown even before the video arrives.
+// The <video> element stays mounted while a stream exists (only hidden when the
+// camera is off) so that the participant's AUDIO keeps playing.
+function VideoTile({ stream, name, muted = false, isLocal = false, showVideo = false, micOn = true, status = '', isHost = false, presenting = false, mirror = false }) {
   const ref = useRef(null)
   useEffect(() => {
-    if (ref.current) ref.current.srcObject = stream || null
+    const video = ref.current
+    if (!video) return
+    if (video.srcObject !== stream) video.srcObject = stream || null
+    if (stream) video.play?.().catch(() => {})
   }, [stream])
-  return <div className={`video-tile ${isLocal ? 'local-tile' : ''}`}>
-    {stream && !cameraOff
-      ? <video ref={ref} autoPlay playsInline muted={muted} />
-      : <div className="avatar">{(name || '?').trim().charAt(0).toUpperCase()}</div>}
-    <div className="tile-label"><span className="live-dot" />{name}{isLocal ? ' (You)' : ''}</div>
+  return <div className={`video-tile ${isLocal ? 'local-tile' : ''} ${presenting ? 'presenting-tile' : ''}`}>
+    {stream && <video ref={ref} autoPlay playsInline muted={muted} className={`${showVideo ? '' : 'video-hidden'} ${mirror ? 'mirrored' : ''}`} />}
+    {!showVideo && <div className="avatar">{initials(name)}</div>}
+    {status && <span className="tile-status">{status}</span>}
+    <div className="tile-label"><span className="live-dot" />{name}{isLocal ? ' (You)' : ''}{isHost && <span className="host-chip">Host</span>}{presenting && <span className="host-chip">Presenting</span>}</div>
+    {!micOn && <span className="muted-indicator" title="Microphone muted"><MicOff size={14}/></span>}
   </div>
 }
 
@@ -94,6 +127,7 @@ export default function App() {
   const [micOn, setMicOn] = useState(true)
   const [cameraOn, setCameraOn] = useState(true)
   const [chatOpen, setChatOpen] = useState(false)
+  const [peopleOpen, setPeopleOpen] = useState(false)
   const [chatInput, setChatInput] = useState('')
   const [messages, setMessages] = useState([])
   const [participants, setParticipants] = useState([])
@@ -103,58 +137,122 @@ export default function App() {
   const socketRef = useRef(null)
   const streamRef = useRef(null)
   const peersRef = useRef({})
+  const pendingCandidatesRef = useRef({})
   const remoteStreamsRef = useRef({})
   const [remoteStreams, setRemoteStreams] = useState({})
+  const [peerStates, setPeerStates] = useState({})
+  const [localStream, setLocalStream] = useState(null)
   const [screenStream, setScreenStream] = useState(null)
-  const screenSendersRef = useRef([])
-  const localVideoRef = useRef(null)
+  const screenStreamRef = useRef(null)
+  const [roomRecording, setRoomRecording] = useState(false)
+  // Saved when we join, so we can join again automatically after a reconnect.
+  const joinInfoRef = useRef(null)
+  const selfIdRef = useRef(null)
+  const participantsRef = useRef([])
+  useEffect(() => { participantsRef.current = participants }, [participants])
 
-  // The local video element is mounted only after the meeting screen renders.
-  // Attach the stream after React has created that element.
-  useEffect(() => {
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = screenStream || streamRef.current || null
-      localVideoRef.current.play?.().catch(() => {})
+  function flash(message, ms = 4000) {
+    setNotice(message)
+    setTimeout(() => setNotice(current => current === message ? '' : current), ms)
+  }
+
+  function currentMediaState() {
+    const stream = streamRef.current
+    return {
+      micOn: Boolean(stream?.getAudioTracks().some(track => track.enabled)),
+      cameraOn: Boolean(stream?.getVideoTracks().some(track => track.enabled)),
+      screenSharing: Boolean(screenStreamRef.current)
     }
-  }, [screenStream, screen, cameraOn, joined])
+  }
+
+  // Close and forget one peer connection. Used on leave, failure and reconnect.
+  function removePeer(id) {
+    peersRef.current[id]?.close()
+    delete peersRef.current[id]
+    delete pendingCandidatesRef.current[id]
+    delete remoteStreamsRef.current[id]
+    setRemoteStreams({ ...remoteStreamsRef.current })
+    setPeerStates(prev => { const next = { ...prev }; delete next[id]; return next })
+  }
+
+  function removeAllPeers() {
+    Object.keys(peersRef.current).forEach(removePeer)
+    peersRef.current = {}; pendingCandidatesRef.current = {}; remoteStreamsRef.current = {}
+    setRemoteStreams({}); setPeerStates({})
+  }
+
+  function emitJoin() {
+    const info = joinInfoRef.current
+    if (!info || !socketRef.current?.connected) return
+    socketRef.current.emit('join-room', { ...info, ...currentMediaState() })
+  }
 
   useEffect(() => {
     refreshRecordings()
     const socket = io(SIGNALING_URL, { autoConnect: true, reconnection: true })
     socketRef.current = socket
-    socket.on('connect', () => setStatus('Connected to meeting server'))
+    socket.on('connect', () => {
+      setStatus('Connected to meeting server')
+      // After a reconnect the server gives us a new ID, so rebuild the call.
+      if (joinInfoRef.current) {
+        removeAllPeers()
+        setParticipants([])
+        emitJoin()
+      }
+    })
+    socket.on('connect_error', err => setStatus(`Cannot reach meeting server (${err.message})`))
     socket.on('disconnect', () => setStatus('Disconnected — reconnecting…'))
     socket.on('chat-message', msg => setMessages(prev => [...prev, msg]))
+    socket.on('room-state', state => {
+      if (state.selfId) selfIdRef.current = state.selfId
+      setIsHost(Boolean(state.hostId) && state.hostId === selfIdRef.current)
+      setRoomRecording(Boolean(state.recording))
+    })
     socket.on('room-users', async users => {
+      // The server sends everyone already in this room to the newly joined user.
+      // The new user starts (offers) a WebRTC connection to each of them.
       setParticipants(users)
       for (const user of users) await createPeer(user.id, true)
     })
     socket.on('user-joined', async user => {
-      setParticipants(prev => prev.some(p => p.id === user.id) ? prev : [...prev, user])
-      setNotice(`${user.name} joined the meeting`)
-      setTimeout(() => setNotice(''), 3000)
+      setParticipants(prev => prev.some(p => p.id === user.id)
+        ? prev.map(p => p.id === user.id ? { ...p, ...user } : p)
+        : [...prev, user])
+      flash(`${user.name} joined the meeting`, 3000)
+      // Wait for their offer; create the connection now so tracks are ready.
       await createPeer(user.id, false)
     })
+    socket.on('media-state', user => {
+      setParticipants(prev => prev.map(p => p.id === user.id ? { ...p, ...user } : p))
+    })
     socket.on('user-left', id => {
-      peersRef.current[id]?.close()
-      delete peersRef.current[id]
-      delete remoteStreamsRef.current[id]
-      setRemoteStreams({ ...remoteStreamsRef.current })
+      const person = participantsRef.current.find(p => p.id === id)
+      if (person) flash(`${person.name} left the meeting`, 3000)
+      removePeer(id)
       setParticipants(prev => prev.filter(p => p.id !== id))
     })
     socket.on('signal', async ({ from, data }) => {
       let pc = peersRef.current[from]
       if (!pc) pc = await createPeer(from, false)
       try {
-        if (data.description) {
+        if (data?.description) {
           await pc.setRemoteDescription(data.description)
+          const queued = pendingCandidatesRef.current[from] || []
+          delete pendingCandidatesRef.current[from]
+          for (const candidate of queued) {
+            try { await pc.addIceCandidate(candidate) } catch (err) { console.warn('Queued ICE candidate could not be added:', err) }
+          }
           if (data.description.type === 'offer') {
             const answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
             socket.emit('signal', { to: from, data: { description: pc.localDescription } })
           }
-        } else if (data.candidate) {
-          await pc.addIceCandidate(data.candidate)
+        } else if (data?.candidate) {
+          if (pc.remoteDescription?.type) {
+            await pc.addIceCandidate(data.candidate)
+          } else {
+            (pendingCandidatesRef.current[from] ||= []).push(data.candidate)
+          }
         }
       } catch (err) { console.error('Signalling error:', err) }
     })
@@ -165,31 +263,60 @@ export default function App() {
     }
   }, [])
 
+  async function sendOffer(peerId, pc, options) {
+    const offer = await pc.createOffer(options)
+    await pc.setLocalDescription(offer)
+    socketRef.current?.emit('signal', { to: peerId, data: { description: pc.localDescription } })
+  }
+
+  // peerId is always the other person's socket.id (the same ID used for
+  // their participant entry and their tile), so streams land on the right tile.
   async function createPeer(peerId, initiator) {
     if (peersRef.current[peerId]) return peersRef.current[peerId]
     const pc = new RTCPeerConnection(iceConfig)
     peersRef.current[peerId] = pc
-    if (streamRef.current) streamRef.current.getTracks().forEach(track => { if (!pc.getSenders().some(sender => sender.track?.id === track.id)) pc.addTrack(track, streamRef.current) })
+    setPeerStates(prev => ({ ...prev, [peerId]: 'connecting' }))
+
+    const local = streamRef.current
+    const audioTrack = local?.getAudioTracks()[0]
+    const videoTrack = screenStreamRef.current?.getVideoTracks()[0] || local?.getVideoTracks()[0]
+    if (audioTrack) pc.addTrack(audioTrack, local)
+    if (videoTrack) pc.addTrack(videoTrack, local || screenStreamRef.current)
+    // IMPORTANT: if this laptop has no camera/mic, the offer would contain no
+    // audio/video sections at all, and the other person's video could never
+    // arrive. "recvonly" sections make sure we can still RECEIVE.
+    if (initiator) {
+      if (!audioTrack) pc.addTransceiver('audio', { direction: 'recvonly' })
+      if (!videoTrack) pc.addTransceiver('video', { direction: 'recvonly' })
+    }
+
     pc.onicecandidate = e => {
       if (e.candidate) socketRef.current?.emit('signal', { to: peerId, data: { candidate: e.candidate } })
     }
     pc.ontrack = e => {
-      const stream = e.streams[0]
-      remoteStreamsRef.current[peerId] = stream
+      // Build a fresh MediaStream for this peer: keep their other tracks and
+      // replace any old track of the same kind (audio / video).
+      const old = remoteStreamsRef.current[peerId]
+      const keep = old ? old.getTracks().filter(track => track.kind !== e.track.kind) : []
+      remoteStreamsRef.current[peerId] = new MediaStream([...keep, e.track])
       setRemoteStreams({ ...remoteStreamsRef.current })
     }
+    let restarted = false
     pc.onconnectionstatechange = () => {
-      if (['failed', 'disconnected'].includes(pc.connectionState)) {
-        setNotice('A connection issue occurred. Some networks require a TURN relay.')
-        setTimeout(() => setNotice(''), 4500)
+      if (peersRef.current[peerId] !== pc) return
+      const state = pc.connectionState
+      setPeerStates(prev => ({ ...prev, [peerId]: state }))
+      if (state === 'failed') {
+        // Try one ICE restart before giving up.
+        if (initiator && !restarted) {
+          restarted = true
+          sendOffer(peerId, pc, { iceRestart: true }).catch(err => console.error('ICE restart failed:', err))
+        }
+        flash('Could not connect video with a participant. On some networks a TURN relay is required.', 6000)
       }
     }
     if (initiator) {
-      try {
-        const offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        socketRef.current?.emit('signal', { to: peerId, data: { description: pc.localDescription } })
-      } catch (err) { console.error(err) }
+      try { await sendOffer(peerId, pc) } catch (err) { console.error('Offer failed:', err) }
     }
     return pc
   }
@@ -263,7 +390,7 @@ export default function App() {
       recordingCanvasRef.current = canvas
       const draw = () => {
         ctx.fillStyle = '#101827'; ctx.fillRect(0, 0, canvas.width, canvas.height)
-        const videos = [...document.querySelectorAll('.video-grid video')].filter(v => v.readyState >= 2 && v.videoWidth)
+        const videos = [...document.querySelectorAll('.video-grid video:not(.video-hidden)')].filter(v => v.readyState >= 2 && v.videoWidth)
         if (!videos.length) {
           ctx.fillStyle = '#ffffff'; ctx.font = 'bold 36px sans-serif'; ctx.fillText('CloudMeet meeting', 48, 80)
           ctx.font = '24px sans-serif'; ctx.fillText(`Room ${room} · ${new Date().toLocaleString()}`, 48, 125)
@@ -310,9 +437,17 @@ export default function App() {
             const token = localStorage.getItem('cloudmeet-token')
             if (token) {
               try {
-                const response = await fetch(`${API_URL}/api/recordings`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'video/webm', 'X-Recording-Room': room, 'X-Recording-Title': `Meeting ${room}`, 'X-Recording-Duration': String(item.durationSeconds) }, body: blob })
+                // The backend (multer) expects a multipart form with a "video" file field.
+                const form = new FormData()
+                form.append('title', `Meeting ${room}`)
+                form.append('room', room)
+                form.append('durationSeconds', String(item.durationSeconds))
+                form.append('video', new File([blob], `cloudmeet-${room}.webm`, { type: 'video/webm' }))
+                const response = await fetch(`${API_URL}/api/recordings`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form })
                 const data = await response.json().catch(() => ({}))
                 if (!response.ok) throw new Error(data.error || 'Upload failed')
+                // Uploaded copy is now in the shared library; remove the duplicate browser copy.
+                await deleteRecording(item.id).catch(() => {})
                 await refreshRecordings()
                 setNotice('Recording uploaded to the shared library. Signed-in users can watch it later.')
               } catch (uploadError) {
@@ -329,6 +464,7 @@ export default function App() {
           cancelAnimationFrame(recordingAnimationRef.current)
           recordingAudioContextRef.current?.close().catch(() => {})
           recordingAudioContextRef.current = null
+          socketRef.current?.emit('recording-state', { recording: false })
           setRecordingActive(false); setRecordingBusy(false)
           setTimeout(() => setNotice(''), 5000)
         }
@@ -336,7 +472,9 @@ export default function App() {
       recorder.startedAt = Date.now()
       recorder.start(1000)
       recorderRef.current = recorder
-      setRecordingActive(true)
+      setRecordingActive(true); setRecordingBusy(false)
+      // Tell everyone in the room that the meeting is being recorded.
+      socketRef.current?.emit('recording-state', { recording: true })
       setNotice('Recording started. Participants in the meeting can be captured; tell everyone before recording.')
       setTimeout(() => setNotice(''), 4000)
     } catch (err) {
@@ -371,7 +509,10 @@ export default function App() {
   }
 
   async function startMeeting(code, host = false) {
-    setIsHost(host)
+    setIsHost(false) // confirmed by the server in 'room-state'
+    setRoomRecording(false)
+    setParticipants([])
+    removeAllPeers()
     const cleanName = name.trim() || 'Guest'
     setName(cleanName)
     localStorage.setItem('cloudmeet-name', cleanName)
@@ -384,7 +525,11 @@ export default function App() {
     streamRef.current?.getTracks().forEach(track => track.stop())
     streamRef.current = null
     try {
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera access needs localhost or HTTPS.')
+      if (!navigator.mediaDevices?.getUserMedia) {
+        const error = new Error('Camera access needs HTTPS. Open the https:// address of CloudMeet.')
+        error.name = window.isSecureContext ? 'NotSupportedError' : 'InsecurePage'
+        throw error
+      }
       let stream
       try { stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: { echoCancellation: true, noiseSuppression: true } }) }
       catch (bothError) {
@@ -397,57 +542,94 @@ export default function App() {
         if (!stream) throw bothError
       }
       streamRef.current = stream
+      setLocalStream(stream)
       setMicOn(stream.getAudioTracks().some(track => track.enabled)); setCameraOn(stream.getVideoTracks().some(track => track.enabled))
     } catch (err) {
       console.error('Media startup failed:', err?.name, err?.message, err)
-      setMicOn(false); setCameraOn(false)
-      setNotice(`Camera/microphone could not start (${err?.name || 'device error'}). Check browser site permissions and Windows privacy settings.`)
-      setTimeout(() => setNotice(''), 8000)
+      setMicOn(false); setCameraOn(false); setLocalStream(null)
+      if (err?.name === 'InsecurePage') flash('Camera and microphone are blocked because this page is not HTTPS. Open https://<host-laptop-IP>:5173 instead. You can still see and hear others.', 10000)
+      else flash(`Camera/microphone could not start (${err?.name || 'device error'}). Check browser site permissions and Windows privacy settings. You can still see and hear others.`, 8000)
     }
-    socketRef.current.emit('join-room', { room: finalCode, name: cleanName })
+    // Join only after media is ready, so our tracks go into every connection.
+    joinInfoRef.current = { room: finalCode, name: cleanName, host }
+    if (socketRef.current?.connected) emitJoin()
+    else flash('Waiting for the meeting server… you will join automatically.', 5000)
     setJoined(true)
     setScreen('meeting')
   }
 
+  function sendMediaState() {
+    socketRef.current?.emit('media-state', currentMediaState())
+  }
+
   function toggleMic() {
+    const tracks = streamRef.current?.getAudioTracks() || []
+    if (!tracks.length) { flash('No microphone is available on this device or permission was denied.'); return }
     const next = !micOn
-    streamRef.current?.getAudioTracks().forEach(t => { t.enabled = next })
+    tracks.forEach(t => { t.enabled = next })
     setMicOn(next)
+    sendMediaState()
   }
   function toggleCamera() {
+    const tracks = streamRef.current?.getVideoTracks() || []
+    if (!tracks.length) { flash('No camera is available on this device or permission was denied.'); return }
     const next = !cameraOn
-    streamRef.current?.getVideoTracks().forEach(t => { t.enabled = next })
+    tracks.forEach(t => { t.enabled = next })
     setCameraOn(next)
+    sendMediaState()
   }
+
+  // Find the video "slot" in a connection. It may have a track (camera) or be
+  // an empty receive-only slot if this laptop had no camera.
+  function findVideoTransceiver(pc) {
+    return pc.getTransceivers().find(t => !t.stopped && t.mid !== null && (t.sender.track?.kind === 'video' || t.receiver.track?.kind === 'video'))
+  }
+
   async function shareScreen() {
     try {
-      if (!navigator.mediaDevices?.getDisplayMedia) { setNotice('Screen sharing requires a supported browser on localhost or HTTPS.'); setTimeout(() => setNotice(''), 4500); return }
+      if (!navigator.mediaDevices?.getDisplayMedia) { flash('Screen sharing requires a supported browser on HTTPS.', 4500); return }
       const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
       const screenTrack = display.getVideoTracks()[0]
       if (!screenTrack) return
-      const senders = []
+      screenStreamRef.current = display
+      setScreenStream(display)
+      let sent = 0
       for (const [peerId, pc] of Object.entries(peersRef.current)) {
-        let sender = pc.getSenders().find(item => item.track?.kind === 'video')
-        if (sender) { await sender.replaceTrack(screenTrack); senders.push(sender) }
-        else {
-          sender = pc.addTrack(screenTrack, display); senders.push(sender)
-          const offer = await pc.createOffer(); await pc.setLocalDescription(offer)
-          socketRef.current?.emit('signal', { to: peerId, data: { description: pc.localDescription } })
-        }
+        try {
+          const sender = pc.getSenders().find(item => item.track?.kind === 'video')
+          if (sender) { await sender.replaceTrack(screenTrack); sent++; continue }
+          // No camera was being sent: turn the receive-only video slot into
+          // send+receive and renegotiate with this peer.
+          const transceiver = findVideoTransceiver(pc)
+          if (transceiver) { transceiver.direction = 'sendrecv'; await transceiver.sender.replaceTrack(screenTrack) }
+          else pc.addTrack(screenTrack, display)
+          await sendOffer(peerId, pc)
+          sent++
+        } catch (error) { console.warn('Could not share screen with', peerId, error) }
       }
-      screenSendersRef.current = senders; setScreenStream(display)
-      screenTrack.onended = async () => {
-        const cameraTrack = streamRef.current?.getVideoTracks()[0] || null
-        await Promise.all(screenSendersRef.current.map(async sender => { try { await sender.replaceTrack(cameraTrack) } catch (error) { console.warn('Could not restore camera track:', error) } }))
-        screenSendersRef.current = []; setScreenStream(null); display.getTracks().forEach(track => track.stop())
-      }
-      setNotice(senders.length ? 'Screen sharing is active for connected participants.' : 'Screen sharing started. A participant must be connected to receive it.')
-      setTimeout(() => setNotice(''), 4500)
+      screenTrack.onended = () => stopScreenShare()
+      sendMediaState()
+      flash(sent ? 'You are presenting your screen to everyone.' : 'Screen sharing started. Participants who join will see it.', 4500)
     } catch (err) {
       console.error('Screen share error:', err?.name, err?.message, err)
       if (!['AbortError', 'NotAllowedError'].includes(err?.name)) { setNotice(`Could not start screen sharing (${err?.name || 'unknown error'}).`); setTimeout(() => setNotice(''), 5000) }
     }
   }
+  async function stopScreenShare() {
+    const display = screenStreamRef.current
+    if (!display) return
+    const screenTrack = display.getVideoTracks()[0]
+    const cameraTrack = streamRef.current?.getVideoTracks()[0] || null
+    await Promise.all(Object.values(peersRef.current).map(async pc => {
+      const sender = pc.getSenders().find(item => item.track && item.track === screenTrack)
+      if (sender) { try { await sender.replaceTrack(cameraTrack) } catch (error) { console.warn('Could not restore camera track:', error) } }
+    }))
+    display.getTracks().forEach(track => track.stop())
+    screenStreamRef.current = null
+    setScreenStream(null)
+    sendMediaState()
+  }
+
   function sendMessage(e) {
     e.preventDefault()
     const text = chatInput.trim()
@@ -479,11 +661,12 @@ export default function App() {
       setAttendance(prev => { const next = [record, ...prev].slice(0, 100); localStorage.setItem('cloudmeet-attendance', JSON.stringify(next)); return next })
       meetingStartedAtRef.current = null
     }
-    Object.values(peersRef.current).forEach(pc => pc.close())
-    peersRef.current = {}; remoteStreamsRef.current = {}; setRemoteStreams({})
-    streamRef.current?.getTracks().forEach(t => t.stop()); streamRef.current = null
-    screenStream?.getTracks().forEach(t => t.stop()); setScreenStream(null); screenSendersRef.current = []
-    setParticipants([]); setJoined(false); setChatOpen(false); setScreen('home')
+    joinInfoRef.current = null
+    removeAllPeers()
+    streamRef.current?.getTracks().forEach(t => t.stop()); streamRef.current = null; setLocalStream(null)
+    screenStreamRef.current?.getTracks().forEach(t => t.stop()); screenStreamRef.current = null; setScreenStream(null)
+    setIsHost(false); setRoomRecording(false)
+    setParticipants([]); setJoined(false); setChatOpen(false); setPeopleOpen(false); setScreen('home')
   }
 
   if (screen === 'auth') return <div className="auth-page">
@@ -505,6 +688,24 @@ export default function App() {
   </div>
 
   if (screen === 'meeting') {
+    // Grid grows with the number of tiles: 1-2 → 2 columns, 3-4 → 2, 5-9 → 3.
+    const tileCount = participants.length + 1 + (participants.length === 0 ? 1 : 0)
+    const gridColumns = tileCount <= 1 ? 1 : tileCount <= 4 ? 2 : tileCount <= 9 ? 3 : 4
+    const connectionLabel = id => ({
+      connected: 'Connected',
+      connecting: 'Connecting…',
+      new: 'Connecting…',
+      disconnected: 'Connection unstable…',
+      failed: 'Video connection failed',
+      closed: 'Disconnected'
+    }[peerStates[id]] || 'Joined')
+    const tileStatus = (id, stream) => {
+      const state = peerStates[id]
+      if (state === 'failed') return 'Video connection failed'
+      if (state === 'disconnected') return 'Reconnecting…'
+      if (!stream && state !== 'connected') return 'Connecting…'
+      return ''
+    }
     return <div className="meeting-app">
       <header className="meeting-header">
         <a className="brand compact" href="#" onClick={e => { e.preventDefault(); leaveMeeting() }}><span className="brand-icon"><Video size={19}/></span><span>Cloud<span className="brand-blue">Meet</span></span></a>
@@ -515,29 +716,61 @@ export default function App() {
       <main className={`meeting-main ${chatOpen ? 'with-chat' : ''}`}>
         <section className="video-stage">
           <div className="stage-topline"><div><span className="eyebrow">LIVE SESSION</span><h1>Team meeting</h1></div><div className="stage-badges"><span className="secure-badge"><ShieldCheck size={14}/> Private room code</span><span className="secure-badge"><Users size={14}/>{participants.length + 1} participant{participants.length ? 's' : ''}</span></div></div>
-          <div className="video-grid">
-            <div className="video-tile local-tile">
-              {screenStream || (cameraOn && streamRef.current) ? <video ref={localVideoRef} autoPlay playsInline muted /> : <div className="avatar">{(name || 'G').charAt(0).toUpperCase()}</div>}
-              <div className="tile-label"><span className="live-dot"/>{name || 'Guest'} (You)</div>
-              {!micOn && <span className="muted-indicator"><MicOff size={14}/></span>}
-            </div>
-            {Object.entries(remoteStreams).map(([id, stream]) => {
-              const person = participants.find(p => p.id === id)
-              return <VideoTile key={id} stream={stream} name={person?.name || 'Participant'} />
+          <section aria-label="Meeting participants" style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap',padding:'10px 12px',margin:'0 0 12px',border:'1px solid #e5e7eb',borderRadius:12,background:'#fff'}}>
+            <button type="button" onClick={() => setPeopleOpen(v => !v)} aria-expanded={peopleOpen} style={{border:0,background:'transparent',fontWeight:700,fontSize:13,color:'#374151',cursor:'pointer',padding:'5px 0'}}>People ({participants.length + 1})</button>
+            <span style={{display:'inline-flex',alignItems:'center',gap:7,padding:'6px 10px',borderRadius:999,background:'#eff6ff',color:'#1d4ed8',fontSize:13}}>
+              <span style={{display:'inline-grid',placeItems:'center',width:24,height:24,borderRadius:'50%',background:'#dbeafe',fontWeight:700}}>{(name || 'G').trim().charAt(0).toUpperCase()}</span>
+              {name || 'Guest'} (You)
+            </span>
+            {participants.map(person => <span key={person.id} style={{display:'inline-flex',alignItems:'center',gap:7,padding:'6px 10px',borderRadius:999,background:'#f3f4f6',color:'#374151',fontSize:13}}>
+              <span style={{display:'inline-grid',placeItems:'center',width:24,height:24,borderRadius:'50%',background:'#e5e7eb',fontWeight:700}}>{(person.name || 'G').trim().charAt(0).toUpperCase()}</span>
+              {person.name || 'Participant'}
+            </span>)}
+          </section>
+          {roomRecording && <div className="recording-banner" role="status"><span className="rec-dot"/> This meeting is being recorded</div>}
+          <div className={`video-grid cols-${gridColumns}`}>
+            <VideoTile
+              isLocal muted mirror={!screenStream}
+              stream={screenStream || localStream}
+              showVideo={Boolean(screenStream) || (cameraOn && Boolean(localStream?.getVideoTracks().length))}
+              name={name || 'Guest'} micOn={micOn} isHost={isHost} presenting={Boolean(screenStream)}
+            />
+            {participants.map(person => {
+              const stream = remoteStreams[person.id] || null
+              const hasVideo = Boolean(stream?.getVideoTracks().length)
+              const showVideo = hasVideo && (person.screenSharing || person.cameraOn !== false)
+              return <VideoTile
+                key={person.id}
+                stream={stream}
+                name={person.name || 'Participant'}
+                showVideo={showVideo}
+                micOn={person.micOn !== false}
+                isHost={person.isHost}
+                presenting={person.screenSharing}
+                status={tileStatus(person.id, stream)}
+              />
             })}
-            {Object.keys(remoteStreams).length === 0 && <div className="empty-tile"><div className="empty-icon"><Users size={27}/></div><h3>Waiting for others to join</h3><p>Share the meeting code so your team can join.</p><button className="button button-light" onClick={copyCode}><Copy size={15}/>{copied ? 'Copied!' : 'Copy meeting code'}</button></div>}
+            {participants.length === 0 && <div className="empty-tile"><div className="empty-icon"><Users size={27}/></div><h3>Waiting for others to join</h3><p>Share the meeting code so your team can join.</p><button className="button button-light" onClick={copyCode}><Copy size={15}/>{copied ? 'Copied!' : 'Copy meeting code'}</button></div>}
           </div>
           <div className="control-dock">
             <div className="control-group">
               <button className={`control ${!micOn ? 'off' : ''}`} onClick={toggleMic}><span>{micOn ? <Mic/> : <MicOff/>}</span><small>{micOn ? 'Mute' : 'Unmute'}</small></button>
               <button className={`control ${!cameraOn ? 'off' : ''}`} onClick={toggleCamera}><span>{cameraOn ? <Video/> : <VideoOff/>}</span><small>{cameraOn ? 'Stop video' : 'Start video'}</small></button>
-              <button className="control" onClick={shareScreen}><span><MonitorUp/></span><small>Share screen</small></button>
-              {isHost && <button className={`control ${recordingActive ? 'recording-control' : ''}`} onClick={recordingActive ? stopRecording : startRecording} disabled={recordingBusy}><span>{recordingActive ? <Square/> : <Circle/>}</span><small>{recordingBusy ? 'Starting…' : recordingActive ? 'Stop recording' : 'Record'}</small></button>}
+              <button className={`control ${screenStream ? 'selected' : ''}`} onClick={screenStream ? stopScreenShare : shareScreen}><span><MonitorUp/></span><small>{screenStream ? 'Stop sharing' : 'Share screen'}</small></button>
+              {isHost && <button className={`control ${recordingActive ? 'recording-control' : ''}`} onClick={recordingActive ? stopRecording : startRecording} disabled={recordingBusy}><span>{recordingActive ? <Square/> : <Circle/>}</span><small>{recordingBusy ? 'Please wait…' : recordingActive ? 'Stop recording' : 'Record'}</small></button>}
+              <button className={`control ${peopleOpen ? 'selected' : ''}`} onClick={() => setPeopleOpen(v => !v)}><span><Users/></span><small>People</small><i className="message-badge">{participants.length + 1}</i></button>
               <button className={`control ${chatOpen ? 'selected' : ''}`} onClick={() => setChatOpen(!chatOpen)}><span><MessageCircle/></span><small>Chat</small>{messages.length > 0 && <i className="message-badge">{messages.length}</i>}</button>
             </div>
             <button className="leave-button" onClick={leaveMeeting}><PhoneOff size={18}/><span>Leave</span></button>
           </div>
         </section>
+        {peopleOpen && <aside className="chat-panel people-panel">
+          <div className="chat-heading"><div><h2>People</h2><p>{participants.length + 1} {participants.length ? 'people' : 'person'} in this meeting</p></div><button className="icon-button" onClick={() => setPeopleOpen(false)} aria-label="Close people panel"><X size={18}/></button></div>
+          <div className="chat-messages">
+            <div className="chat-message person-row"><div className="chat-avatar">{initials(name || 'Guest')}</div><div className="person-info"><div className="chat-meta"><b>{name || 'Guest'} (You)</b>{isHost && <span className="host-chip light">Host</span>}</div><p>{screenStream ? 'Presenting' : 'In the meeting'}</p></div><div className="person-icons">{micOn ? <Mic size={15}/> : <MicOff size={15} className="icon-off"/>}{cameraOn ? <Video size={15}/> : <VideoOff size={15} className="icon-off"/>}</div></div>
+            {participants.map(person => <div className="chat-message person-row" key={person.id}><div className="chat-avatar">{initials(person.name || 'Participant')}</div><div className="person-info"><div className="chat-meta"><b>{person.name || 'Participant'}</b>{person.isHost && <span className="host-chip light">Host</span>}</div><p>{person.screenSharing ? 'Presenting' : connectionLabel(person.id)}</p></div><div className="person-icons">{person.micOn !== false ? <Mic size={15}/> : <MicOff size={15} className="icon-off"/>}{person.cameraOn !== false ? <Video size={15}/> : <VideoOff size={15} className="icon-off"/>}</div></div>)}
+          </div>
+        </aside>}
         {chatOpen && <aside className="chat-panel">
           <div className="chat-heading"><div><h2>Meeting chat</h2><p>Messages for everyone in this room</p></div><button className="icon-button" onClick={() => setChatOpen(false)}><X size={18}/></button></div>
           <div className="chat-messages">{messages.map((m, i) => <div className="chat-message" key={m.id || i}><div className="chat-avatar">{(m.name || 'G').charAt(0).toUpperCase()}</div><div><div className="chat-meta"><b>{m.name}</b><span>{new Date(m.time || Date.now()).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span></div><p>{m.message}</p></div></div>)}{messages.length === 0 && <div className="chat-empty"><MessageCircle size={25}/><b>No messages yet</b><span>Start the conversation.</span></div>}</div>

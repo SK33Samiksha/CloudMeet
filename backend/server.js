@@ -12,7 +12,8 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  writeFileSync
+  writeFileSync,
+  unlinkSync
 } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -54,7 +55,9 @@ function isAllowedOrigin(origin) {
   try {
     const url = new URL(origin)
 
-    if (url.protocol !== 'http:' || url.port !== '5173') {
+    // Vite runs on port 5173. HTTPS is needed so that the second laptop
+    // is allowed to use its camera and microphone.
+    if (!['http:', 'https:'].includes(url.protocol) || url.port !== '5173') {
       return false
     }
 
@@ -152,6 +155,15 @@ function createToken(user) {
     .digest('base64url')
 
   return `${payload}.${signature}`
+}
+
+// A <video src="..."> tag cannot send an Authorization header, so the
+// recording playback route also accepts the token as ?token=...
+function authenticateWithQueryToken(req, res, next) {
+  if (!req.headers.authorization && typeof req.query.token === 'string') {
+    req.headers.authorization = `Bearer ${req.query.token}`
+  }
+  return authenticate(req, res, next)
 }
 
 function authenticate(req, res, next) {
@@ -354,9 +366,14 @@ const upload = multer({
   storage,
   limits: { fileSize: 500 * 1024 * 1024 },
   fileFilter: (_req, file, callback) => {
-    if (file.mimetype.startsWith('video/')) {
+    const extension = path.extname(file.originalname || '').toLowerCase()
+    if (
+      file.mimetype.startsWith('video/') ||
+      ['.webm', '.mp4'].includes(extension)
+    ) {
       callback(null, true)
     } else {
+      console.warn('Rejected upload type:', file.mimetype, file.originalname)
       callback(new Error('Only video files are allowed.'))
     }
   }
@@ -382,6 +399,11 @@ app.post(
       .trim()
       .slice(0, 40)
 
+    const durationSeconds = Math.max(
+      0,
+      Math.min(24 * 60 * 60, Math.round(Number(req.body?.durationSeconds) || 0))
+    )
+
     try {
       const recordings = readJson(RECORDINGS_FILE)
 
@@ -391,6 +413,7 @@ app.post(
         room,
         filename: req.file.filename,
         size: req.file.size,
+        duration_seconds: durationSeconds,
         created_at: new Date().toISOString(),
         host_id: req.user.id,
         host_name: req.user.name
@@ -399,12 +422,7 @@ app.post(
       recordings.unshift(recording)
       writeJson(RECORDINGS_FILE, recordings)
 
-      res.status(201).json({
-        recording: {
-          ...recording,
-          url: `/api/recordings/${recording.id}/video`
-        }
-      })
+      res.status(201).json({ recording: toPublicRecording(recording) })
     } catch (error) {
       console.error('Recording save failed:', error)
       res.status(500).json({
@@ -414,18 +432,25 @@ app.post(
   }
 )
 
+// The field names here match what the React recordings page reads.
+function toPublicRecording(recording) {
+  return {
+    id: recording.id,
+    title: recording.title,
+    room: recording.room,
+    sizeBytes: recording.size,
+    durationSeconds: recording.duration_seconds || 0,
+    createdAt: new Date(recording.created_at).getTime(),
+    hostId: recording.host_id,
+    hostName: recording.host_name,
+    url: `/api/recordings/${recording.id}/video`
+  }
+}
+
 // LIST RECORDINGS
 app.get('/api/recordings', authenticate, (_req, res) => {
   try {
-    const recordings = readJson(RECORDINGS_FILE).map(recording => ({
-      id: recording.id,
-      title: recording.title,
-      room: recording.room,
-      size: recording.size,
-      created_at: recording.created_at,
-      host_name: recording.host_name,
-      url: `/api/recordings/${recording.id}/video`
-    }))
+    const recordings = readJson(RECORDINGS_FILE).map(toPublicRecording)
 
     res.json({ recordings })
   } catch {
@@ -436,7 +461,7 @@ app.get('/api/recordings', authenticate, (_req, res) => {
 })
 
 // STREAM A RECORDING
-app.get('/api/recordings/:id/video', authenticate, (req, res) => {
+app.get('/api/recordings/:id/video', authenticateWithQueryToken, (req, res) => {
   try {
     const recording = readJson(RECORDINGS_FILE)
       .find(item => item.id === req.params.id)
@@ -459,8 +484,63 @@ app.get('/api/recordings/:id/video', authenticate, (req, res) => {
   }
 })
 
+// DELETE A RECORDING (only the host who uploaded it)
+app.delete('/api/recordings/:id', authenticate, (req, res) => {
+  try {
+    const recordings = readJson(RECORDINGS_FILE)
+    const recording = recordings.find(item => item.id === req.params.id)
+
+    if (!recording) {
+      return res.status(404).json({ error: 'Recording not found.' })
+    }
+
+    if (recording.host_id !== req.user.id) {
+      return res.status(403).json({
+        error: 'Only the host who recorded this meeting can delete it.'
+      })
+    }
+
+    const filePath = path.join(RECORDINGS_DIR, recording.filename)
+    if (existsSync(filePath)) unlinkSync(filePath)
+
+    writeJson(
+      RECORDINGS_FILE,
+      recordings.filter(item => item.id !== recording.id)
+    )
+
+    res.json({ ok: true })
+  } catch (error) {
+    console.error('Recording delete failed:', error)
+    res.status(500).json({ error: 'Could not delete recording.' })
+  }
+})
+
 // SOCKET.IO: MEETING CHAT AND WEBRTC SIGNALING
+// roomUsers: room code -> Map(socket.id -> participant details)
+// roomMeta:  room code -> { hostId, recording }
+// The socket.id is the participant ID everywhere: in Socket.IO events,
+// in the browser's peer-connection list, and as the React key of each tile.
 const roomUsers = new Map()
+const roomMeta = new Map()
+
+function publicUser(id, user) {
+  return {
+    id,
+    name: user.name,
+    micOn: user.micOn,
+    cameraOn: user.cameraOn,
+    screenSharing: user.screenSharing,
+    isHost: user.isHost
+  }
+}
+
+function roomState(room) {
+  const meta = roomMeta.get(room) || {}
+  return {
+    hostId: meta.hostId || null,
+    recording: Boolean(meta.recording)
+  }
+}
 
 io.on('connection', socket => {
   socket.on('join-room', payload => {
@@ -479,24 +559,62 @@ io.on('connection', socket => {
     }
 
     const users = roomUsers.get(room) || new Map()
+    const meta = roomMeta.get(room) || { hostId: null, recording: false }
 
-    const existingUsers = [...users.entries()].map(([id, user]) => ({
-      id,
-      name: user.name
-    }))
+    // The person who created the meeting becomes the host. If the host
+    // reconnects (new socket.id), they become host again.
+    if (payload?.host === true && (!meta.hostId || !users.has(meta.hostId))) {
+      meta.hostId = socket.id
+    }
+    roomMeta.set(room, meta)
+
+    const existingUsers = [...users.entries()].map(
+      ([id, user]) => publicUser(id, user)
+    )
 
     socket.join(room)
     socket.data.room = room
     socket.data.name = name
 
-    users.set(socket.id, { name })
+    const user = {
+      name,
+      micOn: payload?.micOn !== false,
+      cameraOn: payload?.cameraOn !== false,
+      screenSharing: false,
+      isHost: meta.hostId === socket.id
+    }
+
+    users.set(socket.id, user)
     roomUsers.set(room, users)
 
+    socket.emit('room-state', { ...roomState(room), selfId: socket.id })
     socket.emit('room-users', existingUsers)
-    socket.to(room).emit('user-joined', {
-      id: socket.id,
-      name
-    })
+    socket.to(room).emit('user-joined', publicUser(socket.id, user))
+  })
+
+  // Microphone / camera / screen-share status, shown to everyone.
+  socket.on('media-state', state => {
+    const room = socket.data.room
+    const user = room && roomUsers.get(room)?.get(socket.id)
+    if (!user) return
+
+    if (typeof state?.micOn === 'boolean') user.micOn = state.micOn
+    if (typeof state?.cameraOn === 'boolean') user.cameraOn = state.cameraOn
+    if (typeof state?.screenSharing === 'boolean') {
+      user.screenSharing = state.screenSharing
+    }
+
+    socket.to(room).emit('media-state', publicUser(socket.id, user))
+  })
+
+  // Only the host may change the recording indicator.
+  socket.on('recording-state', ({ recording } = {}) => {
+    const room = socket.data.room
+    const meta = room && roomMeta.get(room)
+    if (!meta || meta.hostId !== socket.id) return
+
+    meta.recording = Boolean(recording)
+    io.to(room).emit('room-state', roomState(room))
   })
 
   socket.on('signal', ({ to, data } = {}) => {
@@ -508,7 +626,7 @@ io.on('connection', socket => {
     }
   })
 
-  socket.on('chat-message', ({ room, message, name } = {}) => {
+  socket.on('chat-message', ({ room, message } = {}) => {
     const cleanRoom = typeof room === 'string'
       ? room.trim().toUpperCase()
       : ''
@@ -527,9 +645,10 @@ io.on('connection', socket => {
 
     io.to(cleanRoom).emit('chat-message', {
       id: `${Date.now()}-${socket.id}`,
-      name: typeof name === 'string'
-        ? name.trim().slice(0, 32)
-        : socket.data.name || 'Guest',
+      // Use the name the server already knows, so nobody can send a
+      // message pretending to be someone else.
+      senderId: socket.id,
+      name: socket.data.name || 'Guest',
       message: cleanMessage,
       time: Date.now()
     })
@@ -547,9 +666,17 @@ io.on('connection', socket => {
 
       if (users.size === 0) {
         roomUsers.delete(room)
+        roomMeta.delete(room)
       } else {
         roomUsers.set(room, users)
       }
+    }
+
+    // If the host leaves while recording, turn the indicator off.
+    const meta = roomMeta.get(room)
+    if (meta && meta.hostId === socket.id && meta.recording) {
+      meta.recording = false
+      socket.to(room).emit('room-state', roomState(room))
     }
 
     socket.to(room).emit('user-left', socket.id)

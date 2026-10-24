@@ -1,23 +1,33 @@
-# CloudMeet — Updated Video Meeting MVP
+# CloudMeet — Connect. Collaborate. Anywhere.
 
-CloudMeet is a student-project prototype built with React + Vite, Node.js/Express, Socket.IO, and WebRTC.
+CloudMeet is an MCA Cloud Computing Lab prototype: a small video-meeting web app
+built with React + Vite, Node.js/Express, Socket.IO and WebRTC.
 
-## Features in this updated version
+## How it works (architecture)
 
-- **Sign up and sign in:** create an account with your name, email, and password.
-- **Persistent local database:** the backend automatically creates `backend/data/cloudmeet.sqlite` and a `users` table on first start.
-- **Password security:** passwords are stored as salted scrypt hashes, not plain text.
-- **Session token:** successful sign-in returns a signed, seven-day token stored in the browser.
-- Create a meeting room or join with a code.
-- Browser camera and microphone controls.
-- Peer-to-peer WebRTC video for small demo rooms.
-- Room chat through Socket.IO.
-- Personal attendance history saved in each browser.
-- Meeting recording controls and local playback/download library.
+```
+ Laptop 1 (host)                                   Laptop 2
+ ┌───────────────────────────────┐                ┌──────────────┐
+ │ Browser (React app)           │                │ Browser      │
+ │   ▲ https://HOST_IP:5173      │◄── https ──────┤ (React app)  │
+ │ Vite dev server (HTTPS)       │                └──────┬───────┘
+ │   │ forwards /api, /socket.io │                       │
+ │   ▼                           │                       │
+ │ Node/Express + Socket.IO :5000│  signalling, chat,    │
+ │   users.json, recordings/     │  people list          │
+ └───────────────────────────────┘                       │
+        ▲                                                │
+        └──────── WebRTC audio/video (peer-to-peer) ─────┘
+```
 
-## Run locally on Windows
+- **Socket.IO** carries signalling (offers/answers/ICE candidates), chat,
+  join/leave events, mic/camera status and the recording indicator.
+- **WebRTC** carries the audio/video directly between browsers (mesh: every
+  participant connects to every other participant — fine for 4–6 people).
+- Each participant is identified by their **socket ID**, used everywhere: in
+  Socket.IO events, in the peer-connection list, and as the React key of the tile.
 
-Use two PowerShell terminals. Make sure Node.js is installed.
+## Run it (Windows, two PowerShell terminals on the HOST laptop)
 
 ### 1. Backend — terminal 1
 
@@ -27,8 +37,6 @@ npm install
 npm run dev
 ```
 
-The backend runs at `http://localhost:5000`. On first start, it creates the local SQLite database automatically at `backend/data/cloudmeet.sqlite`. You do not need to install MySQL just to test signup/login locally.
-
 ### 2. Frontend — terminal 2
 
 ```powershell
@@ -37,22 +45,76 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173/`. The sign-in/sign-up screen should appear first. Create an account, then sign in. Keep the backend terminal running while using the website.
+Vite prints a **Network** address such as `https://192.168.1.5:5173/`.
+That is the address both laptops use.
 
-If the website was already running before you extracted this updated ZIP, stop the old frontend and backend with `Ctrl+C`, extract this ZIP to a new folder, then run the commands above from the new folder. Do not overwrite your only copy of the old project.
+> **Why HTTPS?** Browsers only allow the camera, microphone and screen sharing
+> on `https://` pages or on `http://localhost`. The second laptop opening
+> `http://HOST_IP:5173` gets **no camera and no microphone**. `npm run dev` now
+> serves HTTPS with a self-signed certificate and forwards `/api` and
+> `/socket.io` to the backend, so only port 5173 needs to be reachable.
 
-## Database notes
+`frontend/.env` should have `VITE_SIGNALING_URL` and `VITE_API_URL` **empty**
+(the browser then uses the same address it opened).
 
-- Local account data is saved in `backend/data/cloudmeet.sqlite` and remains after restarting the backend.
-- Keep the database file private; it contains password hashes and account data.
-- The current account database is **local SQLite**, not Google Cloud SQL. Cloud SQL integration and cloud deployment still need to be configured separately.
-- If you delete `backend/data/cloudmeet.sqlite`, the local accounts in that file will be deleted.
-- Set a long random `TOKEN_SECRET` in a backend `.env` file before any deployment beyond a local demo. Never commit `.env` or database files to Git.
+## Test on two laptops
 
-## Important limitations
+1. Connect both laptops to the **same Wi-Fi** (college Wi-Fi sometimes blocks
+   laptop-to-laptop traffic; a phone hotspot is a good fallback).
+2. On the host laptop find its IP: `ipconfig` → "IPv4 Address".
+3. The first time, Windows Firewall may ask about Node.js — allow it on
+   **Private networks**. Make sure the Wi-Fi is set as a *Private* network.
+4. On **both** laptops open `https://HOST_IP:5173` in Chrome or Edge.
+   You will see a "Your connection is not private" warning because the
+   certificate is self-signed: click **Advanced → Proceed**. (Use the IP
+   address on the host laptop too, not localhost, so both use the same address.)
+5. Sign up / sign in on each laptop (use a different account on each).
+6. Laptop 1: **Create meeting**. Copy the meeting code.
+7. Laptop 2: enter the code → **Join meeting**. Allow camera and microphone.
+8. Check:
+   - both laptops show 2 tiles with names, and the count says 2;
+   - **Stop video** → the other laptop shows your initials;
+   - **Mute** → the other laptop shows a muted icon and the People panel updates;
+   - **Chat** messages appear on both;
+   - **Share screen** → the other laptop sees it, labelled "Presenting";
+     **Stop sharing** returns to the camera;
+   - Host only: **Record** → laptop 2 sees "This meeting is being recorded";
+     **Stop recording** → the video appears under **Recordings** for any
+     signed-in account;
+   - Laptop 2 **Leave** → its tile disappears on laptop 1.
 
-- Attendance and recording files are still saved in each browser only. They are not shared between accounts/devices and are not stored in Google Cloud Storage.
-- Meeting rooms and signalling are held in backend memory and are lost when the backend restarts.
-- Screen sharing currently previews locally; it is not broadcast to other participants.
-- WebRTC uses a public STUN server only. Some networks need a TURN relay. Mesh calling is intended for a small demo, not large rooms.
-- This is an academic prototype, not production-ready authentication or conferencing infrastructure. Use HTTPS, proper rate limiting, secret management, authorization checks, and a production database before public deployment.
+If video does not connect (tile says "Video connection failed"), the network is
+blocking direct connections. Try a phone hotspot, or configure a TURN relay
+(see `frontend/.env.example`). A TURN server may cost money if hosted in the cloud.
+
+`npm run dev:http` starts the old plain-HTTP mode (camera only works on the host
+via `http://localhost:5173`).
+
+## Feature status (honest)
+
+| Feature | Status |
+|---|---|
+| Sign up / sign in (scrypt-hashed passwords, signed token) | Works — stored in `backend/data/users.json` (local file) |
+| Create / join meeting with a code | Works |
+| One tile per participant, names, initials when camera off, "Connecting…" status | Works |
+| Grid adjusts to number of people (1, 2, 3 columns) | Works |
+| Audio/video between laptops (WebRTC mesh, STUN) | Works on the same network; strict networks need TURN |
+| Mic / camera controls, status shown to others | Works |
+| People panel (count, host, mic/camera, connection) | Works |
+| Real-time chat | Works (not saved after the meeting) |
+| Screen sharing to everyone, stop sharing | Works |
+| Host-only recording, visible "being recorded" banner | Works (records in the host's browser) |
+| Recording library / playback for other users | Works — files stored on the backend laptop (`backend/data/recordings/`) |
+| Attendance history | Saved per browser only |
+| Google Cloud SQL (MySQL) | **Not implemented yet** |
+| Google Cloud Storage for recordings | **Not implemented yet** |
+| Deployment to Google Compute Engine, SFU media server | **Not implemented yet** |
+
+Note: `better-sqlite3` is listed in `backend/package.json`, but the current
+server stores users in `users.json`, not SQLite.
+
+## Security notes
+
+- Set a long random `TOKEN_SECRET` in `backend/.env` before any deployment.
+- Never commit `.env`, `backend/data/users.json` or the recordings folder.
+- No cloud credentials are stored in this project.
