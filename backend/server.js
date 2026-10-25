@@ -18,6 +18,13 @@ import {
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import multer from 'multer'
+import {
+  cloudStorageEnabled,
+  cloudStorageBucket,
+  uploadToCloud,
+  streamFromCloud,
+  deleteFromCloud
+} from './cloudStorage.js'
 
 const app = express()
 const server = http.createServer(app)
@@ -290,7 +297,10 @@ app.get('/', (_req, res) => {
 })
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true })
+  res.json({
+    ok: true,
+    recordings: cloudStorageEnabled ? 'cloud-storage' : 'local-disk'
+  })
 })
 
 // SIGN UP
@@ -613,7 +623,7 @@ app.post(
   '/api/recordings',
   authenticate,
   upload.single('video'),
-  (req, res) => {
+  async (req, res) => {
     if (!req.file) {
       return res.status(400).json({
         error: 'Select a video file to upload.'
@@ -654,7 +664,22 @@ app.post(
         duration_seconds: durationSeconds,
         created_at: new Date().toISOString(),
         host_id: req.user.id,
-        host_name: req.user.name
+        host_name: req.user.name,
+        storage: 'local'
+      }
+
+      // Move the video to Google Cloud Storage when a bucket is configured.
+      // If the upload fails, keep the local copy so the recording is not lost.
+      if (cloudStorageEnabled) {
+        const objectName = `recordings/${req.file.filename}`
+        try {
+          await uploadToCloud(req.file.path, objectName, 'video/webm')
+          recording.storage = 'gcs'
+          recording.gcs_object = objectName
+          try { unlinkSync(req.file.path) } catch {}
+        } catch (error) {
+          console.error('Cloud Storage upload failed, keeping local copy:', error.message)
+        }
       }
 
       recordings.unshift(recording)
@@ -748,7 +773,7 @@ app.get('/api/recordings', authenticate, (req, res) => {
 })
 
 // STREAM A RECORDING
-app.get('/api/recordings/:id/video', authenticateWithQueryToken, (req, res) => {
+app.get('/api/recordings/:id/video', authenticateWithQueryToken, async (req, res) => {
   try {
     const recording = readJson(RECORDINGS_FILE)
       .find(item => item.id === req.params.id)
@@ -763,6 +788,13 @@ app.get('/api/recordings/:id/video', authenticateWithQueryToken, (req, res) => {
       })
     }
 
+    if (recording.storage === 'gcs') {
+      if (!cloudStorageEnabled) {
+        return res.status(503).json({ error: 'Cloud Storage is not configured on this server.' })
+      }
+      return await streamFromCloud(recording.gcs_object, req, res)
+    }
+
     const filePath = path.join(RECORDINGS_DIR, recording.filename)
 
     if (!existsSync(filePath)) {
@@ -770,7 +802,9 @@ app.get('/api/recordings/:id/video', authenticateWithQueryToken, (req, res) => {
     }
 
     res.sendFile(filePath)
-  } catch {
+  } catch (error) {
+    console.error('Playback failed:', error.message)
+    if (res.headersSent) return
     res.status(500).json({
       error: 'Could not play recording.'
     })
@@ -838,7 +872,7 @@ app.get('/api/recordings/:id/viewers', authenticate, (req, res) => {
 })
 
 // DELETE A RECORDING (only the host who uploaded it)
-app.delete('/api/recordings/:id', authenticate, (req, res) => {
+app.delete('/api/recordings/:id', authenticate, async (req, res) => {
   try {
     const recordings = readJson(RECORDINGS_FILE)
     const recording = recordings.find(item => item.id === req.params.id)
@@ -853,8 +887,12 @@ app.delete('/api/recordings/:id', authenticate, (req, res) => {
       })
     }
 
-    const filePath = path.join(RECORDINGS_DIR, recording.filename)
-    if (existsSync(filePath)) unlinkSync(filePath)
+    if (recording.storage === 'gcs' && cloudStorageEnabled) {
+      await deleteFromCloud(recording.gcs_object)
+    } else {
+      const filePath = path.join(RECORDINGS_DIR, recording.filename)
+      if (existsSync(filePath)) unlinkSync(filePath)
+    }
 
     writeJson(
       RECORDINGS_FILE,
@@ -1153,4 +1191,7 @@ app.use((error, _req, res, _next) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`CloudMeet backend listening on port ${PORT}`)
   console.log('Allowed frontend origins:', configuredOrigins.join(', '))
+  console.log(cloudStorageEnabled
+    ? `Recordings: Google Cloud Storage bucket "${cloudStorageBucket}"`
+    : 'Recordings: local disk (set GCS_BUCKET to use Cloud Storage)')
 })

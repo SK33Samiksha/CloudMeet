@@ -95,6 +95,38 @@ blocking direct connections. Try a phone hotspot, or configure a TURN relay
 `npm run dev:http` starts the old plain-HTTP mode (camera only works on the host
 via `http://localhost:5173`).
 
+## Cloud deployment (Google Cloud)
+
+```
+ Any browser (Wi-Fi / mobile data)
+        │ https://34-100-229-5.sslip.io
+        ▼
+ Compute Engine VM "cloudmeet-vm" (e2-small, asia-south1, static IP 34.100.229.5)
+   Caddy  :443  — HTTPS certificate (Let's Encrypt), serves the React build,
+                  forwards /api and /socket.io to the backend
+   Node   :5000 — Express + Socket.IO backend (systemd service "cloudmeet")
+   coturn :3478 — TURN relay for networks that block direct WebRTC
+        │
+        ├── Cloud Storage bucket — recording videos (GCS_BUCKET)
+        └── Cloud SQL (MySQL)    — planned (Yogita's project)
+```
+
+Update the VM after pushing new code:
+
+```bash
+cd ~/CloudMeet && git pull
+cd backend && npm install && sudo systemctl restart cloudmeet
+cd ../frontend && npm install && npm run build && sudo cp -r dist/* /var/www/cloudmeet/
+curl -s https://34-100-229-5.sslip.io/health
+```
+
+Cloud Storage for recordings:
+1. Create a bucket (region `asia-south1`, Standard, public access prevention on).
+2. Give the VM's service account the **Storage Object Admin** role on the bucket.
+3. The VM's access scopes must allow Cloud Storage read/write.
+4. Add `GCS_BUCKET=<bucket-name>` to `backend/.env` and restart the backend.
+   `/health` then shows `"recordings":"cloud-storage"`.
+
 ## Feature status (honest)
 
 | Feature | Status |
@@ -114,8 +146,9 @@ via `http://localhost:5173`).
 | Recording library: the host, everyone who attended, and anyone who enters the meeting code (e.g. students who missed the lecture) can watch; only the host can delete and see **who watched** (name and date) | Works — files in `backend/data/recordings/` |
 | Attendance history per account, on any device | Works — saved in `backend/data/meetings.json` |
 | Google Cloud SQL (MySQL) | **Not implemented yet** (JSON files use the same tables/fields) |
-| Google Cloud Storage for recordings | **Not implemented yet** |
-| Deployment to Google Compute Engine, SFU media server | **Not implemented yet** |
+| Google Cloud Storage for recordings | Works when `GCS_BUCKET` is set (falls back to local disk) |
+| Deployment on Google Compute Engine with HTTPS (Caddy) and TURN (coturn) | Works — https://34-100-229-5.sslip.io |
+| SFU media server (VM 2) | Not implemented — mesh is enough for 4–6 people |
 
 ### Where data is saved (local prototype)
 
