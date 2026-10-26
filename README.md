@@ -108,7 +108,8 @@ via `http://localhost:5173`).
    coturn :3478 — TURN relay for networks that block direct WebRTC
         │
         ├── Cloud Storage bucket — recording videos (GCS_BUCKET)
-        └── Cloud SQL (MySQL)    — planned (Yogita's project)
+        └── Cloud SQL (MySQL)    — users, meetings, attendance, chat, recording details
+                                   (instance cloudmeet-mysql, Yogita's project)
 ```
 
 Update the VM after pushing new code:
@@ -126,6 +127,12 @@ Cloud Storage for recordings:
 3. The VM's access scopes must allow Cloud Storage read/write.
 4. Add `GCS_BUCKET=<bucket-name>` to `backend/.env` and restart the backend.
    `/health` then shows `"recordings":"cloud-storage"`.
+
+Cloud SQL (MySQL) for application data:
+1. Create the tables once: `mysql -h <DB_IP> -u cloudmeet_app -p cloudmeet < backend/db/schema.sql`.
+2. In Cloud SQL → Connections → Authorized networks, allow only the VM's IP (`34.100.229.5/32`).
+3. Add `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` (and `DB_SSL=true`) to `backend/.env`,
+   then restart. `/health` then shows `"database":"cloud-sql"`.
 
 ## Feature status (honest)
 
@@ -145,7 +152,7 @@ Cloud Storage for recordings:
 | Host-only recording, visible "being recorded" banner | Works (records in the host's browser) |
 | Recording library: the host, everyone who attended, and anyone who enters the meeting code (e.g. students who missed the lecture) can watch; only the host can delete and see **who watched** (name and date) | Works — files in `backend/data/recordings/` |
 | Attendance history per account, on any device | Works — saved in `backend/data/meetings.json` |
-| Google Cloud SQL (MySQL) | **Not implemented yet** (JSON files use the same tables/fields) |
+| Google Cloud SQL (MySQL) | Works when `DB_HOST` is set — connection `backend/db.js`, queries `backend/store.js`, schema `backend/db/schema.sql`; JSON files otherwise |
 | Google Cloud Storage for recordings | Works when `GCS_BUCKET` is set (falls back to local disk) |
 | Deployment on Google Compute Engine with HTTPS (Caddy) and TURN (coturn) | Works — https://34-100-229-5.sslip.io |
 | SFU media server (VM 2) | Not implemented — mesh is enough for 4–6 people |
