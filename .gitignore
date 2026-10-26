@@ -13,3 +13,4 @@ backend/data/*.sqlite-shm
 backend/data/*.sqlite-wal
 _backup_before_fix/
 backend/data/meetings.json
+backend/certs/

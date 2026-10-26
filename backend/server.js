@@ -1,3 +1,5 @@
+// Load backend/.env for local development (on the VM, systemd provides it).
+import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
 import http from 'node:http'
@@ -18,6 +20,7 @@ import {
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import multer from 'multer'
+import { createStore, DuplicateError } from './store.js'
 import {
   cloudStorageEnabled,
   cloudStorageBucket,
@@ -33,13 +36,13 @@ const PORT = Number(process.env.PORT || 5000)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(__dirname, 'data')
 const RECORDINGS_DIR = path.join(DATA_DIR, 'recordings')
-const USERS_FILE = path.join(DATA_DIR, 'users.json')
-const RECORDINGS_FILE = path.join(DATA_DIR, 'recordings.json')
 
 mkdirSync(RECORDINGS_DIR, { recursive: true })
 
-if (!existsSync(USERS_FILE)) writeFileSync(USERS_FILE, '[]')
-if (!existsSync(RECORDINGS_FILE)) writeFileSync(RECORDINGS_FILE, '[]')
+// Users, meetings, attendance, chat and recording details are stored in
+// Cloud SQL (MySQL) when DB_HOST is set, otherwise in JSON files.
+// See store.js. "store" is created when the server starts (bottom of file).
+let store
 
 // Allow the local frontend and other laptops on the same private network.
 // You can override this using CLIENT_ORIGIN in your backend .env file.
@@ -117,19 +120,6 @@ const TOKEN_SECRET = process.env.TOKEN_SECRET ||
 
 if (!process.env.TOKEN_SECRET) {
   console.warn('Warning: Set TOKEN_SECRET before deployment.')
-}
-
-function readJson(file) {
-  try {
-    return JSON.parse(readFileSync(file, 'utf8'))
-  } catch (error) {
-    console.error(`Could not read ${file}:`, error.message)
-    throw new Error('Data storage is unavailable.')
-  }
-}
-
-function writeJson(file, data) {
-  writeFileSync(file, JSON.stringify(data, null, 2), 'utf8')
 }
 
 function hashPassword(password, salt = randomBytes(16).toString('hex')) {
@@ -221,75 +211,13 @@ function authenticate(req, res, next) {
   next()
 }
 
-// ---------------------------------------------------------------
-// MEETING STORAGE (backend/data/meetings.json)
-// One record per meeting code. The fields follow the Meetings,
-// Participants and Messages tables in the project report, so this
-// can later be moved to Cloud SQL (MySQL) table by table.
-// ---------------------------------------------------------------
-const MEETINGS_FILE = path.join(DATA_DIR, 'meetings.json')
-if (!existsSync(MEETINGS_FILE)) writeFileSync(MEETINGS_FILE, '[]')
-
-const MAX_SAVED_MESSAGES = 300
-
-function loadMeetings() {
-  return readJson(MEETINGS_FILE)
-}
-
-function saveMeetings(meetings) {
-  writeJson(MEETINGS_FILE, meetings)
-}
-
-function findMeeting(code, meetings = loadMeetings()) {
-  return meetings.find(meeting => meeting.id === code) || null
-}
-
-// Change one meeting record and save the file.
-function updateMeeting(code, change) {
-  const meetings = loadMeetings()
-  const meeting = findMeeting(code, meetings)
-  if (!meeting) return null
-  change(meeting)
-  saveMeetings(meetings)
-  return meeting
-}
-
 function cleanCode(value) {
   return typeof value === 'string'
     ? value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12)
     : ''
 }
 
-function newMeetingCode(meetings) {
-  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-  let code
-  do {
-    code = Array.from(randomBytes(6), byte => letters[byte % letters.length]).join('')
-  } while (findMeeting(code, meetings))
-  return code
-}
-
-function attendedMeeting(meeting, userId) {
-  return Boolean(meeting) && (
-    meeting.host_user_id === userId ||
-    meeting.participants.some(person => person.user_id === userId)
-  )
-}
-
-// Who may watch a recording:
-//  - the host who recorded it,
-//  - anyone who attended that meeting,
-//  - anyone who entered the meeting code on the Recordings page
-//    (for example a student who missed the lecture) — saved in "viewers".
-// Older recordings made before meetings were saved have no meeting
-// record, so every signed-in user may see them.
-function canViewRecording(recording, userId, meetings) {
-  if (recording.host_id === userId) return true
-  const meeting = findMeeting(recording.room, meetings)
-  if (!meeting) return true
-  return attendedMeeting(meeting, userId) ||
-    (meeting.viewers || []).includes(userId)
-}
+const MAX_CHAT_HISTORY = 100
 
 // API health checks
 app.get('/', (_req, res) => {
@@ -299,12 +227,13 @@ app.get('/', (_req, res) => {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    recordings: cloudStorageEnabled ? 'cloud-storage' : 'local-disk'
+    recordings: cloudStorageEnabled ? 'cloud-storage' : 'local-disk',
+    database: store?.mode === 'mysql' ? 'cloud-sql' : 'json-files'
   })
 })
 
 // SIGN UP
-app.post('/api/auth/signup', (req, res) => {
+app.post('/api/auth/signup', async (req, res) => {
   const name = typeof req.body?.name === 'string'
     ? req.body.name.trim().slice(0, 80)
     : ''
@@ -334,37 +263,22 @@ app.post('/api/auth/signup', (req, res) => {
   }
 
   try {
-    const users = readJson(USERS_FILE)
-
-    if (users.some(user => user.email === email)) {
-      return res.status(409).json({
-        error: 'This account already exists. Please sign in.'
-      })
-    }
-
-    const id = users.reduce(
-      (max, user) => Math.max(max, Number(user.id) || 0),
-      0
-    ) + 1
-
-    const newUser = {
-      id,
+    const user = await store.createUser({
       name,
       email,
-      password_hash: hashPassword(password),
-      created_at: new Date().toISOString()
-    }
-
-    users.push(newUser)
-    writeJson(USERS_FILE, users)
-
-    const user = { id, name, email }
+      password_hash: hashPassword(password)
+    })
 
     return res.status(201).json({
       user,
       token: createToken(user)
     })
   } catch (error) {
+    if (error instanceof DuplicateError) {
+      return res.status(409).json({
+        error: 'This account already exists. Please sign in.'
+      })
+    }
     console.error('Signup failed:', error)
     return res.status(500).json({
       error: 'Could not create the account.'
@@ -373,7 +287,7 @@ app.post('/api/auth/signup', (req, res) => {
 })
 
 // SIGN IN
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const email = typeof req.body?.email === 'string'
     ? req.body.email.trim().toLowerCase()
     : ''
@@ -383,8 +297,7 @@ app.post('/api/auth/login', (req, res) => {
     : ''
 
   try {
-    const users = readJson(USERS_FILE)
-    const account = users.find(user => user.email === email)
+    const account = await store.findUserByEmail(email)
 
     if (!account || !verifyPassword(password, account.password_hash)) {
       return res.status(401).json({
@@ -411,10 +324,9 @@ app.post('/api/auth/login', (req, res) => {
 })
 
 // GET SIGNED-IN ACCOUNT
-app.get('/api/auth/me', authenticate, (req, res) => {
+app.get('/api/auth/me', authenticate, async (req, res) => {
   try {
-    const account = readJson(USERS_FILE)
-      .find(user => user.id === req.user.id)
+    const account = await store.findUserById(req.user.id)
 
     if (!account) {
       return res.status(404).json({ error: 'Account not found.' })
@@ -433,7 +345,7 @@ app.get('/api/auth/me', authenticate, (req, res) => {
 })
 
 // UPDATE PROFILE (display name)
-app.put('/api/auth/profile', authenticate, (req, res) => {
+app.put('/api/auth/profile', authenticate, async (req, res) => {
   const name = typeof req.body?.name === 'string'
     ? req.body.name.trim().slice(0, 80)
     : ''
@@ -443,17 +355,12 @@ app.put('/api/auth/profile', authenticate, (req, res) => {
   }
 
   try {
-    const users = readJson(USERS_FILE)
-    const account = users.find(user => user.id === req.user.id)
+    const user = await store.updateUserName(req.user.id, name)
 
-    if (!account) {
+    if (!user) {
       return res.status(404).json({ error: 'Account not found.' })
     }
 
-    account.name = name
-    writeJson(USERS_FILE, users)
-
-    const user = { id: account.id, name: account.name, email: account.email }
     // The token contains the name, so give the browser a fresh token.
     res.json({ user, token: createToken(user) })
   } catch (error) {
@@ -463,7 +370,7 @@ app.put('/api/auth/profile', authenticate, (req, res) => {
 })
 
 // CHANGE PASSWORD
-app.put('/api/auth/password', authenticate, (req, res) => {
+app.put('/api/auth/password', authenticate, async (req, res) => {
   const currentPassword = typeof req.body?.currentPassword === 'string'
     ? req.body.currentPassword
     : ''
@@ -478,8 +385,7 @@ app.put('/api/auth/password', authenticate, (req, res) => {
   }
 
   try {
-    const users = readJson(USERS_FILE)
-    const account = users.find(user => user.id === req.user.id)
+    const account = await store.findUserById(req.user.id)
 
     if (!account) {
       return res.status(404).json({ error: 'Account not found.' })
@@ -489,8 +395,7 @@ app.put('/api/auth/password', authenticate, (req, res) => {
       return res.status(400).json({ error: 'Current password is incorrect.' })
     }
 
-    account.password_hash = hashPassword(newPassword)
-    writeJson(USERS_FILE, users)
+    await store.updateUserPassword(req.user.id, hashPassword(newPassword))
     res.json({ ok: true })
   } catch (error) {
     console.error('Password change failed:', error)
@@ -499,26 +404,17 @@ app.put('/api/auth/password', authenticate, (req, res) => {
 })
 
 // CREATE A MEETING — the server generates a unique code.
-app.post('/api/meetings', authenticate, (req, res) => {
+app.post('/api/meetings', authenticate, async (req, res) => {
   const title = typeof req.body?.title === 'string' && req.body.title.trim()
     ? req.body.title.trim().slice(0, 80)
     : 'Team meeting'
 
   try {
-    const meetings = loadMeetings()
-    const meeting = {
-      id: newMeetingCode(meetings),
+    const meeting = await store.createMeeting({
       title,
       host_user_id: req.user.id,
-      host_name: req.user.name,
-      created_at: new Date().toISOString(),
-      status: 'scheduled',
-      participants: [],
-      viewers: [],
-      messages: []
-    }
-    meetings.push(meeting)
-    saveMeetings(meetings)
+      host_name: req.user.name
+    })
     res.status(201).json({
       meeting: { id: meeting.id, title: meeting.title, hostName: meeting.host_name }
     })
@@ -529,9 +425,9 @@ app.post('/api/meetings', authenticate, (req, res) => {
 })
 
 // CHECK A MEETING CODE (used by the join form and invite links)
-app.get('/api/meetings/:code', authenticate, (req, res) => {
+app.get('/api/meetings/:code', authenticate, async (req, res) => {
   try {
-    const meeting = findMeeting(cleanCode(req.params.code))
+    const meeting = await store.getMeeting(cleanCode(req.params.code))
 
     if (!meeting) {
       return res.status(404).json({
@@ -554,34 +450,25 @@ app.get('/api/meetings/:code', authenticate, (req, res) => {
 })
 
 // MY ATTENDANCE — every time this user joined a meeting (any device).
-app.get('/api/attendance', authenticate, (req, res) => {
+app.get('/api/attendance', authenticate, async (req, res) => {
   try {
-    const records = []
+    const records = (await store.listAttendance(req.user.id)).map(record => ({
+      id: record.id,
+      room: record.room,
+      title: record.title,
+      name: record.name,
+      role: record.isHost ? 'Host' : 'Participant',
+      joinedAt: record.joinedAt,
+      leftAt: record.leftAt,
+      durationMinutes: record.leftAt
+        ? Math.max(1, Math.round((record.leftAt - record.joinedAt) / 60000))
+        : null,
+      participantCount: record.participantCount
+    }))
 
-    for (const meeting of loadMeetings()) {
-      for (const person of meeting.participants) {
-        if (person.user_id !== req.user.id) continue
-        const joinedAt = new Date(person.joined_at).getTime()
-        const leftAt = person.left_at ? new Date(person.left_at).getTime() : null
-        records.push({
-          id: person.id,
-          room: meeting.id,
-          title: meeting.title,
-          name: person.name,
-          role: meeting.host_user_id === req.user.id ? 'Host' : 'Participant',
-          joinedAt,
-          leftAt,
-          durationMinutes: leftAt
-            ? Math.max(1, Math.round((leftAt - joinedAt) / 60000))
-            : null,
-          participantCount: new Set(meeting.participants.map(p => p.user_id)).size
-        })
-      }
-    }
-
-    records.sort((a, b) => b.joinedAt - a.joinedAt)
     res.json({ attendance: records })
-  } catch {
+  } catch (error) {
+    console.error('Attendance failed:', error.message)
     res.status(500).json({ error: 'Could not load attendance.' })
   }
 })
@@ -634,26 +521,29 @@ app.post(
       .trim()
       .slice(0, 120)
 
-    const room = String(req.body?.room || '')
-      .trim()
-      .slice(0, 40)
+    const room = cleanCode(String(req.body?.room || ''))
 
     const durationSeconds = Math.max(
       0,
       Math.min(24 * 60 * 60, Math.round(Number(req.body?.durationSeconds) || 0))
     )
 
-    // Only the meeting's host may upload its recording.
-    const meeting = findMeeting(cleanCode(room))
-    if (meeting && meeting.host_user_id !== req.user.id) {
-      try { unlinkSync(req.file.path) } catch {}
-      return res.status(403).json({
-        error: 'Only the host of this meeting can save its recording.'
-      })
-    }
-
     try {
-      const recordings = readJson(RECORDINGS_FILE)
+      // Only the meeting's host may upload its recording.
+      const meeting = await store.getMeeting(room)
+      if (meeting && meeting.host_user_id !== req.user.id) {
+        try { unlinkSync(req.file.path) } catch {}
+        return res.status(403).json({
+          error: 'Only the host of this meeting can save its recording.'
+        })
+      }
+      // In the database every recording must belong to a saved meeting.
+      if (!meeting && store.mode === 'mysql') {
+        try { unlinkSync(req.file.path) } catch {}
+        return res.status(400).json({
+          error: 'This meeting was not found, so the recording could not be saved.'
+        })
+      }
 
       const recording = {
         id: randomBytes(12).toString('hex'),
@@ -682,8 +572,7 @@ app.post(
         }
       }
 
-      recordings.unshift(recording)
-      writeJson(RECORDINGS_FILE, recordings)
+      await store.createRecording(recording)
 
       res.status(201).json({ recording: toPublicRecording(recording) })
     } catch (error) {
@@ -713,7 +602,7 @@ function toPublicRecording(recording) {
 // UNLOCK A MEETING'S RECORDINGS WITH ITS CODE
 // A student who missed the meeting enters the code the host shared.
 // From then on, all recordings of that meeting appear in their library.
-app.post('/api/recordings/access', authenticate, (req, res) => {
+app.post('/api/recordings/access', authenticate, async (req, res) => {
   const code = cleanCode(req.body?.code)
 
   if (!code) {
@@ -721,15 +610,7 @@ app.post('/api/recordings/access', authenticate, (req, res) => {
   }
 
   try {
-    const meeting = updateMeeting(code, record => {
-      record.viewers = record.viewers || []
-      if (
-        !attendedMeeting(record, req.user.id) &&
-        !record.viewers.includes(req.user.id)
-      ) {
-        record.viewers.push(req.user.id)
-      }
-    })
+    const meeting = await store.addViewer(code, req.user.id)
 
     if (!meeting) {
       return res.status(404).json({
@@ -737,8 +618,7 @@ app.post('/api/recordings/access', authenticate, (req, res) => {
       })
     }
 
-    const count = readJson(RECORDINGS_FILE)
-      .filter(recording => recording.room === code).length
+    const count = await store.countRecordingsInRoom(code)
 
     res.json({
       meeting: { id: meeting.id, title: meeting.title, hostName: meeting.host_name },
@@ -751,21 +631,24 @@ app.post('/api/recordings/access', authenticate, (req, res) => {
 })
 
 // LIST RECORDINGS
-app.get('/api/recordings', authenticate, (req, res) => {
+app.get('/api/recordings', authenticate, async (req, res) => {
   try {
-    const meetings = loadMeetings()
-    const recordings = readJson(RECORDINGS_FILE)
-      .filter(recording => canViewRecording(recording, req.user.id, meetings))
-      .map(recording => ({
-        ...toPublicRecording(recording),
-        // Only the host is told how many people watched.
-        viewCount: recording.host_id === req.user.id
-          ? (recording.views || []).length
-          : undefined
-      }))
+    const visible = []
+    for (const recording of await store.listRecordings()) {
+      if (await store.canViewRecording(recording, req.user.id)) {
+        visible.push({
+          ...toPublicRecording(recording),
+          // Only the host is told how many people watched.
+          viewCount: recording.host_id === req.user.id
+            ? recording.view_count || 0
+            : undefined
+        })
+      }
+    }
 
-    res.json({ recordings })
-  } catch {
+    res.json({ recordings: visible })
+  } catch (error) {
+    console.error('Recording list failed:', error.message)
     res.status(500).json({
       error: 'Could not load recordings.'
     })
@@ -775,14 +658,13 @@ app.get('/api/recordings', authenticate, (req, res) => {
 // STREAM A RECORDING
 app.get('/api/recordings/:id/video', authenticateWithQueryToken, async (req, res) => {
   try {
-    const recording = readJson(RECORDINGS_FILE)
-      .find(item => item.id === req.params.id)
+    const recording = await store.getRecording(req.params.id)
 
     if (!recording) {
       return res.status(404).json({ error: 'Recording not found.' })
     }
 
-    if (!canViewRecording(recording, req.user.id, loadMeetings())) {
+    if (!(await store.canViewRecording(recording, req.user.id))) {
       return res.status(403).json({
         error: 'Only people who attended this meeting can watch the recording.'
       })
@@ -813,29 +695,22 @@ app.get('/api/recordings/:id/video', authenticateWithQueryToken, async (req, res
 
 // SOMEONE PRESSED PLAY — remember their name and the date.
 // One entry per person; watching again updates the date.
-app.post('/api/recordings/:id/view', authenticate, (req, res) => {
+app.post('/api/recordings/:id/view', authenticate, async (req, res) => {
   try {
-    const recordings = readJson(RECORDINGS_FILE)
-    const recording = recordings.find(item => item.id === req.params.id)
+    const recording = await store.getRecording(req.params.id)
 
     if (!recording) {
       return res.status(404).json({ error: 'Recording not found.' })
     }
 
-    if (!canViewRecording(recording, req.user.id, loadMeetings())) {
+    if (!(await store.canViewRecording(recording, req.user.id))) {
       return res.status(403).json({ error: 'You cannot watch this recording.' })
     }
 
     // The host watching their own recording is not counted.
     if (recording.host_id !== req.user.id) {
-      const account = readJson(USERS_FILE).find(user => user.id === req.user.id)
-      recording.views = (recording.views || []).filter(view => view.user_id !== req.user.id)
-      recording.views.push({
-        user_id: req.user.id,
-        name: account?.name || req.user.name,
-        watched_at: new Date().toISOString()
-      })
-      writeJson(RECORDINGS_FILE, recordings)
+      const account = await store.findUserById(req.user.id)
+      await store.recordView(recording.id, req.user.id, account?.name || req.user.name)
     }
 
     res.json({ ok: true })
@@ -846,10 +721,9 @@ app.post('/api/recordings/:id/view', authenticate, (req, res) => {
 })
 
 // WHO WATCHED A RECORDING (only the host who recorded it)
-app.get('/api/recordings/:id/viewers', authenticate, (req, res) => {
+app.get('/api/recordings/:id/viewers', authenticate, async (req, res) => {
   try {
-    const recording = readJson(RECORDINGS_FILE)
-      .find(item => item.id === req.params.id)
+    const recording = await store.getRecording(req.params.id)
 
     if (!recording) {
       return res.status(404).json({ error: 'Recording not found.' })
@@ -861,12 +735,13 @@ app.get('/api/recordings/:id/viewers', authenticate, (req, res) => {
       })
     }
 
-    const viewers = (recording.views || [])
+    const viewers = (await store.listViews(recording.id))
       .map(view => ({ name: view.name, watchedAt: new Date(view.watched_at).getTime() }))
       .sort((a, b) => b.watchedAt - a.watchedAt)
 
     res.json({ viewers })
-  } catch {
+  } catch (error) {
+    console.error('Viewer list failed:', error.message)
     res.status(500).json({ error: 'Could not load viewers.' })
   }
 })
@@ -874,8 +749,7 @@ app.get('/api/recordings/:id/viewers', authenticate, (req, res) => {
 // DELETE A RECORDING (only the host who uploaded it)
 app.delete('/api/recordings/:id', authenticate, async (req, res) => {
   try {
-    const recordings = readJson(RECORDINGS_FILE)
-    const recording = recordings.find(item => item.id === req.params.id)
+    const recording = await store.getRecording(req.params.id)
 
     if (!recording) {
       return res.status(404).json({ error: 'Recording not found.' })
@@ -894,10 +768,7 @@ app.delete('/api/recordings/:id', authenticate, async (req, res) => {
       if (existsSync(filePath)) unlinkSync(filePath)
     }
 
-    writeJson(
-      RECORDINGS_FILE,
-      recordings.filter(item => item.id !== recording.id)
-    )
+    await store.deleteRecording(recording.id)
 
     res.json({ ok: true })
   } catch (error) {
@@ -912,6 +783,7 @@ app.delete('/api/recordings/:id', authenticate, async (req, res) => {
 // The socket.id is the participant ID everywhere: in Socket.IO events,
 // in the browser's peer-connection list, and as the React key of each tile.
 // The signed-in account (user ID) is used for attendance and permissions.
+// Live room state is kept in memory; attendance and chat are saved by "store".
 const roomUsers = new Map()
 const roomMeta = new Map()
 
@@ -936,7 +808,7 @@ function roomState(room) {
 }
 
 io.on('connection', socket => {
-  socket.on('join-room', payload => {
+  socket.on('join-room', async payload => {
     const room = cleanCode(payload?.room)
 
     const name = typeof payload?.name === 'string'
@@ -955,8 +827,9 @@ io.on('connection', socket => {
 
     let meeting
     try {
-      meeting = findMeeting(room)
-    } catch {
+      meeting = await store.getMeeting(room)
+    } catch (lookupError) {
+      console.error('Meeting lookup failed:', lookupError.message)
       return socket.emit('join-error', { error: 'Meeting data is unavailable. Check the backend.' })
     }
 
@@ -965,6 +838,8 @@ io.on('connection', socket => {
         error: `No meeting found with code ${room}. Check the code and try again.`
       })
     }
+
+    if (!socket.connected) return
 
     if (socket.data.room) {
       leaveRoom(socket.data.room)
@@ -1001,36 +876,39 @@ io.on('connection', socket => {
     users.set(socket.id, user)
     roomUsers.set(room, users)
 
-    // Save attendance: one entry per join, closed when they leave.
     const attendanceId = randomBytes(8).toString('hex')
     socket.data.attendanceId = attendanceId
-    let history = []
+
+    socket.emit('room-state', { ...roomState(room), selfId: socket.id })
+    socket.emit('room-users', existingUsers)
+    socket.to(room).emit('user-joined', publicUser(socket.id, user))
+
+    // Save attendance (one entry per join, closed when they leave)
+    // and send this meeting's earlier chat messages.
     try {
-      const saved = updateMeeting(room, record => {
-        record.status = 'live'
-        record.participants.push({
-          id: attendanceId,
-          user_id: account.id,
-          name,
-          joined_at: new Date().toISOString(),
-          left_at: null
-        })
+      await store.addParticipant(room, {
+        id: attendanceId,
+        user_id: account.id,
+        name,
+        joined_at: new Date()
       })
-      history = (saved?.messages || []).slice(-100).map(message => ({
+    } catch (saveError) {
+      console.error('Could not save attendance:', saveError.message)
+    }
+
+    try {
+      const history = (await store.getRecentMessages(room, MAX_CHAT_HISTORY)).map(message => ({
         id: message.id,
         senderId: null,
         name: message.name,
         message: message.message_text,
         time: new Date(message.sent_at).getTime()
       }))
-    } catch (saveError) {
-      console.error('Could not save attendance:', saveError.message)
+      socket.emit('chat-history', history)
+    } catch (historyError) {
+      console.error('Could not load chat history:', historyError.message)
+      socket.emit('chat-history', [])
     }
-
-    socket.emit('room-state', { ...roomState(room), selfId: socket.id })
-    socket.emit('chat-history', history)
-    socket.emit('room-users', existingUsers)
-    socket.to(room).emit('user-joined', publicUser(socket.id, user))
   })
 
   // Microphone / camera / screen-share status, shown to everyone.
@@ -1094,23 +972,14 @@ io.on('connection', socket => {
 
     io.to(cleanRoom).emit('chat-message', chat)
 
-    // Keep the chat with the meeting (like the Messages table).
-    try {
-      updateMeeting(cleanRoom, record => {
-        record.messages.push({
-          id: chat.id,
-          sender_user_id: socket.data.userId,
-          name: chat.name,
-          message_text: chat.message,
-          sent_at: new Date(chat.time).toISOString()
-        })
-        if (record.messages.length > MAX_SAVED_MESSAGES) {
-          record.messages = record.messages.slice(-MAX_SAVED_MESSAGES)
-        }
-      })
-    } catch (saveError) {
-      console.error('Could not save chat message:', saveError.message)
-    }
+    // Keep the chat with the meeting (Messages table).
+    store.addMessage(cleanRoom, {
+      id: chat.id,
+      sender_user_id: socket.data.userId,
+      name: chat.name,
+      message_text: chat.message,
+      sent_at: new Date(chat.time)
+    }).catch(saveError => console.error('Could not save chat message:', saveError.message))
   })
 
   function leaveRoom(room) {
@@ -1136,14 +1005,9 @@ io.on('connection', socket => {
     // Close this person's attendance entry.
     const attendanceId = socket.data.attendanceId
     socket.data.attendanceId = null
-    try {
-      updateMeeting(room, record => {
-        const entry = record.participants.find(item => item.id === attendanceId)
-        if (entry && !entry.left_at) entry.left_at = new Date().toISOString()
-        if (roomIsEmpty) record.status = 'ended'
-      })
-    } catch (saveError) {
-      console.error('Could not save leave time:', saveError.message)
+    if (attendanceId) {
+      store.closeParticipant(room, attendanceId, roomIsEmpty)
+        .catch(saveError => console.error('Could not save leave time:', saveError.message))
     }
 
     // If the host leaves while recording, turn the indicator off.
@@ -1187,10 +1051,22 @@ app.use((error, _req, res, _next) => {
   })
 })
 
+// START: connect to the database (Cloud SQL or JSON files), then listen.
+try {
+  store = await createStore()
+} catch (error) {
+  console.error('Could not connect to the database:', error.message)
+  console.error('Check DB_HOST, DB_USER, DB_PASSWORD, DB_NAME and the Cloud SQL authorized networks.')
+  process.exit(1)
+}
+
 // LISTEN ON ALL NETWORK INTERFACES
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`CloudMeet backend listening on port ${PORT}`)
   console.log('Allowed frontend origins:', configuredOrigins.join(', '))
+  console.log(store.mode === 'mysql'
+    ? `Database: Cloud SQL (MySQL) at ${process.env.DB_HOST}, database "${process.env.DB_NAME || 'cloudmeet'}"`
+    : 'Database: JSON files in backend/data (set DB_HOST to use Cloud SQL)')
   console.log(cloudStorageEnabled
     ? `Recordings: Google Cloud Storage bucket "${cloudStorageBucket}"`
     : 'Recordings: local disk (set GCS_BUCKET to use Cloud Storage)')
