@@ -129,6 +129,8 @@ export default function App() {
   const recordingCanvasRef = useRef(null)
   const recordingAnimationRef = useRef(null)
   const recordingAudioContextRef = useRef(null)
+  const recordingStopDrawingRef = useRef(null)
+  const [recordingStatus, setRecordingStatus] = useState('')
   const [attendance, setAttendance] = useState([])
   const [attendanceError, setAttendanceError] = useState('')
   const [recordingsError, setRecordingsError] = useState('')
@@ -508,6 +510,15 @@ export default function App() {
     } catch (err) { setProfileError(err.message) } finally { setProfileBusy(false) }
   }
 
+  // ---------------------------------------------------------------
+  // RECORDING OF THE WHOLE MEETING (replaces the old startRecording
+  // and stopRecording). Everything visible is drawn onto one canvas:
+  //  - no screen share: all camera tiles in a grid
+  //  - someone shares: the shared screen is large, cameras in a side strip
+  // The audio of everyone (and people who join later) is mixed in.
+  // The drawing timer runs in a Web Worker, so the recording keeps going
+  // when the host switches to another window while sharing.
+  // ---------------------------------------------------------------
   async function startRecording() {
     if (!streamRef.current) {
       setNotice('Allow camera and microphone before starting a recording.')
@@ -520,61 +531,150 @@ export default function App() {
       return
     }
     try {
-      setRecordingBusy(true)
+      setRecordingBusy(true); setRecordingStatus('Starting…')
+      const W = 1280, H = 720, PAD = 20, GAP = 12
       const canvas = document.createElement('canvas')
-      canvas.width = 1280; canvas.height = 720
+      canvas.width = W; canvas.height = H
       const ctx = canvas.getContext('2d')
       recordingCanvasRef.current = canvas
-      const draw = () => {
-        ctx.fillStyle = '#101827'; ctx.fillRect(0, 0, canvas.width, canvas.height)
-        const videos = [...document.querySelectorAll('.video-grid video:not(.video-hidden)')].filter(v => v.readyState >= 2 && v.videoWidth)
-        if (!videos.length) {
+
+      // Hidden <video> elements used only for drawing (independent of the page layout).
+      const feeds = new Map()
+      const feedFor = (key, stream) => {
+        let el = feeds.get(key)
+        if (!el) {
+          el = document.createElement('video')
+          el.muted = true; el.playsInline = true; el.autoplay = true
+          feeds.set(key, el)
+        }
+        if (el.srcObject !== stream) { el.srcObject = stream; el.play().catch(() => {}) }
+        return el
+      }
+      const ready = el => el.readyState >= 2 && el.videoWidth > 0
+
+      // Which videos exist right now? Read from refs so late joiners and new screen shares are picked up.
+      const collectTiles = () => {
+        const screens = [], cameras = []
+        const myName = name || 'Guest'
+        const mine = streamRef.current
+        const myScreen = screenStreamRef.current
+        if (myScreen) screens.push({ el: feedFor('me-screen', myScreen), label: `${myName} (screen)` })
+        if (mine && mine.getVideoTracks().some(t => t.enabled && t.readyState === 'live')) {
+          cameras.push({ el: feedFor('me', mine), label: `${myName} (You)` })
+        }
+        for (const person of participantsRef.current) {
+          const stream = remoteStreamsRef.current[person.id]
+          if (!stream || !stream.getVideoTracks().length) continue
+          if (person.screenSharing) screens.push({ el: feedFor(person.id, stream), label: `${person.name || 'Participant'} (screen)` })
+          else if (person.cameraOn !== false) cameras.push({ el: feedFor(person.id, stream), label: person.name || 'Participant' })
+        }
+        return { screens, cameras }
+      }
+
+      const drawTile = (el, x, y, w, h, label, contain) => {
+        ctx.save(); ctx.beginPath(); ctx.roundRect(x, y, w, h, 14); ctx.clip()
+        ctx.fillStyle = '#0b1220'; ctx.fillRect(x, y, w, h)
+        if (ready(el)) {
+          const scale = contain ? Math.min(w / el.videoWidth, h / el.videoHeight) : Math.max(w / el.videoWidth, h / el.videoHeight)
+          const dw = el.videoWidth * scale, dh = el.videoHeight * scale
+          ctx.drawImage(el, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh)
+        }
+        ctx.restore()
+        if (label) {
+          ctx.font = '600 18px sans-serif'
+          const tw = ctx.measureText(label).width + 20
+          ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(x + 10, y + h - 38, tw, 28)
+          ctx.fillStyle = '#ffffff'; ctx.fillText(label, x + 20, y + h - 18)
+        }
+      }
+      const drawGrid = (items, x, y, w, h, contain) => {
+        const n = items.length
+        const cols = n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : 4
+        const rows = Math.ceil(n / cols)
+        const tw = (w - GAP * (cols - 1)) / cols, th = (h - GAP * (rows - 1)) / rows
+        items.forEach((item, i) => drawTile(item.el, x + (i % cols) * (tw + GAP), y + Math.floor(i / cols) * (th + GAP), tw, th, item.label, contain))
+      }
+      const drawFrame = () => {
+        ctx.fillStyle = '#101827'; ctx.fillRect(0, 0, W, H)
+        const { screens, cameras } = collectTiles()
+        if (screens.length) {
+          const sideW = cameras.length ? 300 : 0
+          const mainW = W - PAD * 2 - (sideW ? sideW + PAD : 0)
+          drawGrid(screens, PAD, PAD, mainW, H - PAD * 2, true)
+          if (sideW) {
+            const n = cameras.length
+            const th = Math.min(200, (H - PAD * 2 - GAP * (n - 1)) / n)
+            cameras.forEach((cam, i) => drawTile(cam.el, W - PAD - sideW, PAD + i * (th + GAP), sideW, th, cam.label, false))
+          }
+        } else if (cameras.length) {
+          drawGrid(cameras, PAD, PAD, W - PAD * 2, H - PAD * 2, false)
+        } else {
           ctx.fillStyle = '#ffffff'; ctx.font = 'bold 36px sans-serif'; ctx.fillText('CloudMeet meeting', 48, 80)
           ctx.font = '24px sans-serif'; ctx.fillText(`Room ${room} · ${new Date().toLocaleString()}`, 48, 125)
-        } else {
-          const cols = videos.length === 1 ? 1 : 2
-          const rows = Math.ceil(videos.length / cols)
-          const gap = 16, pad = 24
-          const tileW = (canvas.width - pad * 2 - gap * (cols - 1)) / cols
-          const tileH = (canvas.height - pad * 2 - gap * (rows - 1)) / rows
-          videos.forEach((video, i) => {
-            const x = pad + (i % cols) * (tileW + gap), y = pad + Math.floor(i / cols) * (tileH + gap)
-            const scale = Math.max(tileW / video.videoWidth, tileH / video.videoHeight)
-            const sw = tileW / scale, sh = tileH / scale
-            ctx.save(); ctx.beginPath(); ctx.roundRect(x, y, tileW, tileH, 18); ctx.clip()
-            ctx.drawImage(video, (video.videoWidth - sw) / 2, (video.videoHeight - sh) / 2, sw, sh, x, y, tileW, tileH)
-            ctx.restore()
-          })
         }
-        recordingAnimationRef.current = requestAnimationFrame(draw)
       }
-      draw()
-      const output = canvas.captureStream(24)
+
+      // Timer that is not slowed down in background tabs.
+      let stopTicker
+      try {
+        const code = 'let t;onmessage=e=>{clearInterval(t);if(e.data)t=setInterval(()=>postMessage(0),e.data)}'
+        const worker = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })))
+        worker.onmessage = drawFrame
+        worker.postMessage(40)
+        stopTicker = () => worker.terminate()
+      } catch {
+        const id = setInterval(drawFrame, 40)
+        stopTicker = () => clearInterval(id)
+      }
+      drawFrame()
+
+      // Mix the audio of everyone. Checked every second, so people who join later are included.
       const audioContext = new AudioContext()
       recordingAudioContextRef.current = audioContext
+      audioContext.resume?.().catch(() => {})
       const destination = audioContext.createMediaStreamDestination()
-      const audioStreams = [streamRef.current, ...Object.values(remoteStreamsRef.current)]
-      audioStreams.forEach(stream => {
-        if (stream?.getAudioTracks().length) {
-          const audioOnly = new MediaStream(stream.getAudioTracks())
-          audioContext.createMediaStreamSource(audioOnly).connect(destination)
-        }
-      })
+      const connectedTracks = new Set()
+      const syncAudio = () => {
+        const streams = [streamRef.current, ...Object.values(remoteStreamsRef.current)]
+        streams.forEach(stream => stream?.getAudioTracks().forEach(track => {
+          if (connectedTracks.has(track.id) || track.readyState !== 'live') return
+          connectedTracks.add(track.id)
+          audioContext.createMediaStreamSource(new MediaStream([track])).connect(destination)
+        }))
+      }
+      syncAudio()
+      const audioTimer = setInterval(syncAudio, 1000)
+      recordingStopDrawingRef.current = () => {
+        stopTicker(); clearInterval(audioTimer)
+        feeds.forEach(el => { el.srcObject = null }); feeds.clear()
+      }
+
+      const output = canvas.captureStream(25)
       destination.stream.getAudioTracks().forEach(track => output.addTrack(track))
-      const options = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus') ? { mimeType: 'video/webm;codecs=vp9,opus' } : { mimeType: 'video/webm' }
-      const recorder = new MediaRecorder(output, options)
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus') ? 'video/webm;codecs=vp9,opus' : 'video/webm'
+      const recorder = new MediaRecorder(output, { mimeType, videoBitsPerSecond: 2500000 })
       recordingChunksRef.current = []
       recorder.ondataavailable = event => { if (event.data?.size) recordingChunksRef.current.push(event.data) }
+      recorder.onerror = event => console.error('Recorder error:', event.error || event)
       recorder.onstop = async () => {
+        recordingStopDrawingRef.current?.(); recordingStopDrawingRef.current = null
+        socketRef.current?.emit('recording-state', { recording: false })
+        setRecordingBusy(true); setRecordingStatus('Saving recording…')
         try {
-          const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || 'video/webm' })
-          if (blob.size) {
-            const item = { id: `${Date.now()}-${room}`, title: meetingTitle || `Meeting ${room}`, room, createdAt: Date.now(), durationSeconds: Math.max(1, Math.round((Date.now() - (recorder.startedAt || Date.now())) / 1000)), blob }
-            await saveRecording(item)
-            const token = localStorage.getItem('cloudmeet-token')
-            if (token) {
+          const blob = new Blob(recordingChunksRef.current, { type: 'video/webm' })
+          recordingChunksRef.current = []
+          if (!blob.size) { setNotice('Nothing was recorded.'); return }
+          const item = {
+            id: `${Date.now()}-${room}`, title: meetingTitle || `Meeting ${room}`, room, createdAt: Date.now(),
+            durationSeconds: Math.max(1, Math.round((Date.now() - (recorder.startedAt || Date.now())) / 1000)), blob
+          }
+          const token = localStorage.getItem('cloudmeet-token')
+          let uploaded = false, reason = 'You are not signed in.'
+          if (token) {
+            // Try the shared upload first (twice), and only then keep a copy in this browser.
+            for (let attempt = 1; attempt <= 2 && !uploaded; attempt++) {
               try {
-                // The backend (multer) expects a multipart form with a "video" file field.
+                setRecordingStatus(attempt === 1 ? 'Uploading recording…' : 'Retrying upload…')
                 const form = new FormData()
                 form.append('title', item.title)
                 form.append('room', room)
@@ -582,48 +682,68 @@ export default function App() {
                 form.append('video', new File([blob], `cloudmeet-${room}.webm`, { type: 'video/webm' }))
                 const response = await fetch(`${API_URL}/api/recordings`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form })
                 const data = await response.json().catch(() => ({}))
-                if (!response.ok) throw new Error(data.error || 'Upload failed')
-                // Uploaded copy is now in the shared library; remove the duplicate browser copy.
-                await deleteRecording(item.id).catch(() => {})
-                await refreshRecordings()
-                setNotice('Recording saved. Everyone who attended this meeting can watch it under Recordings.')
+                if (!response.ok) throw new Error(data.error || `Upload failed (${response.status})`)
+                uploaded = true
               } catch (uploadError) {
-                console.error('Shared recording upload failed:', uploadError)
-                await refreshRecordings()
-                setNotice('Saved only in this browser because shared upload failed. Check the backend terminal.')
+                reason = uploadError.message || 'Upload failed.'
+                console.error(`Recording upload attempt ${attempt} failed:`, uploadError)
               }
-            } else { await refreshRecordings(); setNotice('Recording saved locally. Sign in to upload it for other users.') }
+            }
           }
+          if (uploaded) {
+            setNotice('Recording saved. Everyone who attended this meeting can watch it under Recordings.')
+          } else {
+            try {
+              await saveRecording(item)
+              setNotice(`Saved only in this browser because the upload failed (${reason}).`)
+            } catch (storeError) {
+              console.error(storeError)
+              setNotice(`The recording could not be saved (${reason}).`)
+            }
+          }
+          await refreshRecordings()
         } catch (err) {
           console.error(err)
-          setNotice('The recording could not be saved. Browser storage may be full.')
+          setNotice('The recording could not be saved.')
         } finally {
-          cancelAnimationFrame(recordingAnimationRef.current)
           recordingAudioContextRef.current?.close().catch(() => {})
           recordingAudioContextRef.current = null
-          socketRef.current?.emit('recording-state', { recording: false })
-          setRecordingActive(false); setRecordingBusy(false)
-          setTimeout(() => setNotice(''), 5000)
+          recorderRef.current = null
+          setRecordingActive(false); setRecordingBusy(false); setRecordingStatus('')
+          setTimeout(() => setNotice(''), 8000)
         }
       }
       recorder.startedAt = Date.now()
       recorder.start(1000)
       recorderRef.current = recorder
-      setRecordingActive(true); setRecordingBusy(false)
+      setRecordingActive(true); setRecordingBusy(false); setRecordingStatus('')
       // Tell everyone in the room that the meeting is being recorded.
       socketRef.current?.emit('recording-state', { recording: true })
-      setNotice('Recording started. Participants in the meeting can be captured; tell everyone before recording.')
+      setNotice('Recording started. Keep this meeting tab open until you stop recording.')
       setTimeout(() => setNotice(''), 4000)
     } catch (err) {
       console.error('Recording error:', err)
+      recordingStopDrawingRef.current?.(); recordingStopDrawingRef.current = null
+      recordingAudioContextRef.current?.close().catch(() => {}); recordingAudioContextRef.current = null
       setNotice('Could not start recording. Check browser permissions and try again.')
-      setRecordingBusy(false)
+      setRecordingBusy(false); setRecordingStatus('')
       setTimeout(() => setNotice(''), 5000)
     }
   }
 
   function stopRecording() {
-    if (recorderRef.current && recorderRef.current.state !== 'inactive') recorderRef.current.stop()
+    const recorder = recorderRef.current
+    if (recorder && recorder.state !== 'inactive') {
+      // Update the button and the banner straight away; the upload continues in the background.
+      setRecordingBusy(true); setRecordingStatus('Saving recording…')
+      socketRef.current?.emit('recording-state', { recording: false })
+      try { recorder.stop() } catch (err) { console.error('Could not stop recorder:', err) }
+      return
+    }
+    // The recorder is not running any more: reset a stuck button.
+    recordingStopDrawingRef.current?.(); recordingStopDrawingRef.current = null
+    socketRef.current?.emit('recording-state', { recording: false })
+    setRecordingActive(false); setRecordingBusy(false); setRecordingStatus('')
   }
 
   async function openRecording(item) {
@@ -858,7 +978,7 @@ export default function App() {
       <label className="auth-label">Password<input type="password" autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} value={authPassword} onChange={e => setAuthPassword(e.target.value)} placeholder={authMode === 'signup' ? 'At least 8 characters' : 'Enter your password'} minLength={authMode === 'signup' ? 8 : undefined} required /></label>
       <button className="button button-primary full auth-submit" type="submit" disabled={authBusy}>{authBusy ? 'Please wait…' : authMode === 'signup' ? 'Create account' : 'Sign in'} <ArrowRight size={16}/></button>
       <p className="auth-switch">{authMode === 'signup' ? 'Already have an account?' : "Don't have an account?"} <button type="button" onClick={() => { setAuthMode(authMode === 'signup' ? 'login' : 'signup'); setAuthError('') }}>{authMode === 'signup' ? 'Sign in' : 'Sign up'}</button></p>
-      <p className="auth-footnote">Your account is saved in the CloudMeet backend database on this machine. This local database is not yet Google Cloud SQL.</p>
+      <p className="auth-footnote">Your account is stored securely in the CloudMeet cloud database (Google Cloud SQL).</p>
     </form></div>
   </div>
 
@@ -932,7 +1052,7 @@ export default function App() {
               <button className={`control ${!micOn ? 'off' : ''}`} onClick={toggleMic}><span>{micOn ? <Mic/> : <MicOff/>}</span><small>{micOn ? 'Mute' : 'Unmute'}</small></button>
               <button className={`control ${!cameraOn ? 'off' : ''}`} onClick={toggleCamera}><span>{cameraOn ? <Video/> : <VideoOff/>}</span><small>{cameraOn ? 'Stop video' : 'Start video'}</small></button>
               <button className={`control ${screenStream ? 'selected' : ''}`} onClick={screenStream ? stopScreenShare : shareScreen}><span><MonitorUp/></span><small>{screenStream ? 'Stop sharing' : 'Share screen'}</small></button>
-              {isHost && <button className={`control ${recordingActive ? 'recording-control' : ''}`} onClick={recordingActive ? stopRecording : startRecording} disabled={recordingBusy}><span>{recordingActive ? <Square/> : <Circle/>}</span><small>{recordingBusy ? 'Please wait…' : recordingActive ? 'Stop recording' : 'Record'}</small></button>}
+              {isHost && <button className={`control ${recordingActive ? 'recording-control' : ''}`} onClick={recordingActive ? stopRecording : startRecording} disabled={recordingBusy}><span>{recordingActive ? <Square/> : <Circle/>}</span><small>{recordingBusy ? (recordingStatus || 'Please wait…') : recordingActive ? 'Stop recording' : 'Record'}</small></button>}
               <button className={`control ${peopleOpen ? 'selected' : ''}`} onClick={() => setPeopleOpen(v => !v)}><span><Users/></span><small>People</small><i className="message-badge">{participants.length + 1}</i></button>
               <button className={`control ${chatOpen ? 'selected' : ''}`} onClick={() => setChatOpen(!chatOpen)}><span><MessageCircle/></span><small>Chat</small>{messages.length > 0 && <i className="message-badge">{messages.length}</i>}</button>
             </div>
