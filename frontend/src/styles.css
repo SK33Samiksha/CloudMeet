@@ -197,3 +197,9 @@
 .viewers-list li{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid #f3f5f9}
 .viewers-list li span:last-child{color:#7a879b;white-space:nowrap}
 .button.viewers-open{border-color:#2563eb;color:#2563eb}
+
+/* ---- Laptop meeting grid: show the whole camera picture instead of a cropped strip ---- */
+@media(min-width:851px){
+  .video-grid{grid-auto-rows:minmax(240px,1fr)}
+  .video-tile video{object-fit:contain;background:#0b1220}
+}
