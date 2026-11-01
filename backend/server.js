@@ -219,6 +219,34 @@ function cleanCode(value) {
 
 const MAX_CHAT_HISTORY = 100
 
+// Recordings are deleted automatically this many days after they are made.
+// Set RECORDING_RETENTION_DAYS=0 in backend/.env to keep them forever.
+const configuredDays = Number(process.env.RECORDING_RETENTION_DAYS)
+const RETENTION_DAYS = process.env.RECORDING_RETENTION_DAYS?.trim() && Number.isFinite(configuredDays)
+  ? configuredDays
+  : 30
+
+function recordingExpiry(from = new Date()) {
+  return RETENTION_DAYS > 0
+    ? new Date(from.getTime() + RETENTION_DAYS * 24 * 60 * 60 * 1000)
+    : null
+}
+
+// The host types the guest list of an invite-only meeting as free text
+// ("a@x.com, b@y.com") or the browser sends an array. Returns clean,
+// unique, lowercase addresses (at most 50).
+function parseInviteEmails(value) {
+  const parts = Array.isArray(value)
+    ? value
+    : typeof value === 'string' ? value.split(/[\s,;]+/) : []
+
+  const emails = parts
+    .map(item => String(item).trim().toLowerCase())
+    .filter(item => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item))
+
+  return [...new Set(emails)].slice(0, 50)
+}
+
 // API health checks
 app.get('/', (_req, res) => {
   res.json({ app: 'CloudMeet API', status: 'running' })
@@ -409,14 +437,34 @@ app.post('/api/meetings', authenticate, async (req, res) => {
     ? req.body.title.trim().slice(0, 80)
     : 'Team meeting'
 
+  // "ask": anyone signed in who has the code can ask to join, and the host
+  // lets them in. "invite": only the e-mail addresses the host lists can ask.
+  const accessType = req.body?.accessType === 'invite' ? 'invite' : 'ask'
+  const invitedEmails = accessType === 'invite'
+    ? parseInviteEmails(req.body?.invitedEmails)
+    : []
+
+  if (accessType === 'invite' && invitedEmails.length === 0) {
+    return res.status(400).json({
+      error: 'Add at least one valid email address for an invite-only meeting.'
+    })
+  }
+
   try {
     const meeting = await store.createMeeting({
       title,
       host_user_id: req.user.id,
-      host_name: req.user.name
+      host_name: req.user.name,
+      access_type: accessType,
+      invited_emails: invitedEmails
     })
     res.status(201).json({
-      meeting: { id: meeting.id, title: meeting.title, hostName: meeting.host_name }
+      meeting: {
+        id: meeting.id,
+        title: meeting.title,
+        hostName: meeting.host_name,
+        accessType: meeting.access_type
+      }
     })
   } catch (error) {
     console.error('Meeting create failed:', error)
@@ -435,12 +483,26 @@ app.get('/api/meetings/:code', authenticate, async (req, res) => {
       })
     }
 
+    // Invite-only: tell people who are not on the guest list right away.
+    const isHost = meeting.host_user_id === req.user.id
+    const email = String(req.user.email || '').toLowerCase()
+    if (
+      !isHost &&
+      meeting.access_type === 'invite' &&
+      !(meeting.invited_emails || []).includes(email)
+    ) {
+      return res.status(403).json({
+        error: 'This meeting is invite-only and your email address is not on the guest list.'
+      })
+    }
+
     res.json({
       meeting: {
         id: meeting.id,
         title: meeting.title,
         hostName: meeting.host_name,
         status: meeting.status,
+        accessType: meeting.access_type,
         createdAt: new Date(meeting.created_at).getTime()
       }
     })
@@ -555,7 +617,9 @@ app.post(
         created_at: new Date().toISOString(),
         host_id: req.user.id,
         host_name: req.user.name,
-        storage: 'local'
+        storage: 'local',
+        // The video is deleted automatically after RECORDING_RETENTION_DAYS.
+        expires_at: recordingExpiry()?.toISOString() || null
       }
 
       // Move the video to Google Cloud Storage when a bucket is configured.
@@ -595,13 +659,16 @@ function toPublicRecording(recording) {
     createdAt: new Date(recording.created_at).getTime(),
     hostId: recording.host_id,
     hostName: recording.host_name,
+    expiresAt: recording.expires_at ? new Date(recording.expires_at).getTime() : null,
     url: `/api/recordings/${recording.id}/video`
   }
 }
 
-// UNLOCK A MEETING'S RECORDINGS WITH ITS CODE
-// A student who missed the meeting enters the code the host shared.
-// From then on, all recordings of that meeting appear in their library.
+// ASK FOR ACCESS TO A MEETING'S RECORDINGS
+// Knowing the meeting code is NOT enough. Someone who missed the meeting
+// enters the code to send a request; the host of that meeting must approve
+// it (see /api/recordings/requests below) before any recording is visible.
+// People who were admitted to the meeting already have access.
 app.post('/api/recordings/access', authenticate, async (req, res) => {
   const code = cleanCode(req.body?.code)
 
@@ -610,23 +677,81 @@ app.post('/api/recordings/access', authenticate, async (req, res) => {
   }
 
   try {
-    const meeting = await store.addViewer(code, req.user.id)
+    const account = await store.findUserById(req.user.id)
+    const result = await store.addRecordingRequest(
+      code,
+      req.user.id,
+      account?.name || req.user.name
+    )
 
-    if (!meeting) {
+    if (!result) {
       return res.status(404).json({
         error: 'No meeting found with this code. Check the code and try again.'
       })
     }
 
-    const count = await store.countRecordingsInRoom(code)
+    const { meeting, status } = result
 
     res.json({
+      status,
       meeting: { id: meeting.id, title: meeting.title, hostName: meeting.host_name },
-      recordingCount: count
+      // The number of recordings is only revealed once access is approved.
+      recordingCount: status === 'approved'
+        ? await store.countRecordingsInRoom(code)
+        : undefined
     })
   } catch (error) {
     console.error('Recording access failed:', error)
-    res.status(500).json({ error: 'Could not check the meeting code.' })
+    res.status(500).json({ error: 'Could not send the request.' })
+  }
+})
+
+// REQUESTS WAITING FOR THE HOST (only for meetings this user hosts)
+app.get('/api/recordings/requests', authenticate, async (req, res) => {
+  try {
+    const requests = (await store.listRecordingRequests(req.user.id)).map(item => ({
+      meetingId: item.meeting_id,
+      title: item.title,
+      userId: Number(item.user_id),
+      name: item.name,
+      requestedAt: new Date(item.requested_at).getTime()
+    }))
+
+    res.json({ requests })
+  } catch (error) {
+    console.error('Request list failed:', error.message)
+    res.status(500).json({ error: 'Could not load access requests.' })
+  }
+})
+
+// HOST APPROVES OR DECLINES A REQUEST
+app.post('/api/recordings/requests/:code/:userId/:decision', authenticate, async (req, res) => {
+  const code = cleanCode(req.params.code)
+  const userId = Number(req.params.userId)
+  const decision = req.params.decision
+
+  if (!code || !Number.isInteger(userId) || !['approve', 'deny'].includes(decision)) {
+    return res.status(400).json({ error: 'Invalid request.' })
+  }
+
+  try {
+    const done = await store.resolveRecordingRequest(
+      code,
+      userId,
+      req.user.id,
+      decision === 'approve'
+    )
+
+    if (!done) {
+      return res.status(404).json({
+        error: 'Request not found, or you are not the host of this meeting.'
+      })
+    }
+
+    res.json({ ok: true })
+  } catch (error) {
+    console.error('Resolving request failed:', error)
+    res.status(500).json({ error: 'Could not save your decision.' })
   }
 })
 
@@ -666,7 +791,7 @@ app.get('/api/recordings/:id/video', authenticateWithQueryToken, async (req, res
 
     if (!(await store.canViewRecording(recording, req.user.id))) {
       return res.status(403).json({
-        error: 'Only people who attended this meeting can watch the recording.'
+        error: 'Only the host and people the host approved can watch this recording.'
       })
     }
 
@@ -687,6 +812,11 @@ app.get('/api/recordings/:id/video', authenticateWithQueryToken, async (req, res
   } catch (error) {
     console.error('Playback failed:', error.message)
     if (res.headersSent) return
+    if (error.code === 404) {
+      return res.status(404).json({
+        error: 'This recording has expired and was deleted.'
+      })
+    }
     res.status(500).json({
       error: 'Could not play recording.'
     })
@@ -746,6 +876,38 @@ app.get('/api/recordings/:id/viewers', authenticate, async (req, res) => {
   }
 })
 
+// Remove the video file itself (from Cloud Storage or from the server disk).
+async function deleteRecordingFiles(recording) {
+  if (recording.storage === 'gcs' && cloudStorageEnabled) {
+    await deleteFromCloud(recording.gcs_object)
+  } else {
+    const filePath = path.join(RECORDINGS_DIR, recording.filename)
+    if (existsSync(filePath)) unlinkSync(filePath)
+  }
+}
+
+// AUTOMATIC CLEAN-UP: delete recordings whose expiry date has passed.
+// Runs a little after start-up and then every hour. A Cloud Storage
+// "lifecycle rule" (see README) is a second safety net.
+async function removeExpiredRecordings() {
+  try {
+    for (const recording of await store.listExpiredRecordings(new Date())) {
+      // Cannot reach the bucket from here: leave the record for the next run.
+      if (recording.storage === 'gcs' && !cloudStorageEnabled) continue
+
+      try {
+        await deleteRecordingFiles(recording)
+        await store.deleteRecording(recording.id)
+        console.log(`Deleted expired recording ${recording.id} ("${recording.title}")`)
+      } catch (error) {
+        console.error(`Could not delete expired recording ${recording.id}:`, error.message)
+      }
+    }
+  } catch (error) {
+    console.error('Expired recording check failed:', error.message)
+  }
+}
+
 // DELETE A RECORDING (only the host who uploaded it)
 app.delete('/api/recordings/:id', authenticate, async (req, res) => {
   try {
@@ -761,13 +923,7 @@ app.delete('/api/recordings/:id', authenticate, async (req, res) => {
       })
     }
 
-    if (recording.storage === 'gcs' && cloudStorageEnabled) {
-      await deleteFromCloud(recording.gcs_object)
-    } else {
-      const filePath = path.join(RECORDINGS_DIR, recording.filename)
-      if (existsSync(filePath)) unlinkSync(filePath)
-    }
-
+    await deleteRecordingFiles(recording)
     await store.deleteRecording(recording.id)
 
     res.json({ ok: true })
@@ -778,14 +934,28 @@ app.delete('/api/recordings/:id', authenticate, async (req, res) => {
 })
 
 // SOCKET.IO: MEETING CHAT AND WEBRTC SIGNALING
-// roomUsers: room code -> Map(socket.id -> participant details)
-// roomMeta:  room code -> { hostId, recording }
+// roomUsers:    room code -> Map(socket.id -> participant details)
+// roomMeta:     room code -> { hostId, recording, title, accessType }
+// roomPending:  room code -> Map(socket.id -> { name, userId })  (waiting room)
+// roomAdmitted: room code -> Set(user IDs the host already let in)
 // The socket.id is the participant ID everywhere: in Socket.IO events,
 // in the browser's peer-connection list, and as the React key of each tile.
 // The signed-in account (user ID) is used for attendance and permissions.
 // Live room state is kept in memory; attendance and chat are saved by "store".
+//
+// WHO MAY ENTER A MEETING
+//  1. The host (the account that created the meeting) always enters.
+//  2. Everyone else must be signed in AND approved by the host. A guest who
+//     enters a valid code only reaches the WAITING ROOM: the server does not
+//     put them in the Socket.IO room, so they cannot see, hear, chat with or
+//     send signals to anyone until the host presses "Admit".
+//  3. In an invite-only meeting the guest's e-mail must also be on the
+//     host's list, otherwise they are refused before reaching the waiting room.
 const roomUsers = new Map()
 const roomMeta = new Map()
+const roomPending = new Map()
+const roomAdmitted = new Map()
+const MAX_WAITING_PER_ROOM = 30
 
 function publicUser(id, user) {
   return {
@@ -803,7 +973,167 @@ function roomState(room) {
   return {
     hostId: meta.hostId || null,
     recording: Boolean(meta.recording),
-    title: meta.title || 'Team meeting'
+    title: meta.title || 'Team meeting',
+    accessType: meta.accessType || 'ask'
+  }
+}
+
+function pendingList(room) {
+  return [...(roomPending.get(room) || new Map()).entries()]
+    .map(([id, person]) => ({ id, name: person.name }))
+}
+
+// Tell the host (if they are in the meeting) who is waiting outside.
+function sendPendingToHost(room) {
+  const hostSocketId = roomMeta.get(room)?.hostId
+  if (hostSocketId) io.to(hostSocketId).emit('join-requests', pendingList(room))
+}
+
+// Remove a socket from the waiting room (admitted, denied, cancelled or gone).
+function stopWaiting(socket) {
+  const room = socket.data.waitingRoom
+  if (!room) return
+  socket.data.waitingRoom = null
+  socket.data.pendingJoin = null
+
+  const pending = roomPending.get(room)
+  if (pending) {
+    pending.delete(socket.id)
+    if (pending.size === 0) roomPending.delete(room)
+  }
+  sendPendingToHost(room)
+}
+
+// The room this socket hosts right now, or null if it is not the host.
+function hostedRoom(socket) {
+  const room = socket.data.room
+  const meta = room && roomMeta.get(room)
+  return meta && meta.hostId === socket.id ? room : null
+}
+
+// Put a socket into the live meeting (host, or a guest the host admitted).
+async function enterRoom(socket, { room, meeting, account, name, payload }) {
+  if (!socket.connected) return
+
+  const users = roomUsers.get(room) || new Map()
+  const meta = roomMeta.get(room) || { hostId: null, recording: false }
+  meta.title = meeting.title
+  meta.accessType = meeting.access_type || 'ask'
+
+  // The account that created the meeting is the host. If the host
+  // reconnects (new socket.id), they become host again.
+  const isHostAccount = meeting.host_user_id === account.id
+  if (isHostAccount) meta.hostId = socket.id
+  roomMeta.set(room, meta)
+
+  // Remember that this person was let in, so a page refresh or a short
+  // network drop does not send them back to the waiting room.
+  if (!isHostAccount) {
+    const admitted = roomAdmitted.get(room) || new Set()
+    admitted.add(account.id)
+    roomAdmitted.set(room, admitted)
+  }
+
+  const existingUsers = [...users.entries()].map(
+    ([id, user]) => publicUser(id, user)
+  )
+
+  socket.join(room)
+  socket.data.room = room
+  socket.data.name = name
+  socket.data.userId = account.id
+
+  const user = {
+    name,
+    userId: account.id,
+    micOn: payload?.micOn !== false,
+    cameraOn: payload?.cameraOn !== false,
+    screenSharing: false,
+    isHost: isHostAccount
+  }
+
+  users.set(socket.id, user)
+  roomUsers.set(room, users)
+
+  const attendanceId = randomBytes(8).toString('hex')
+  socket.data.attendanceId = attendanceId
+
+  socket.emit('room-state', { ...roomState(room), selfId: socket.id })
+  socket.emit('room-users', existingUsers)
+  socket.to(room).emit('user-joined', publicUser(socket.id, user))
+
+  // The host also receives the list of people already waiting.
+  if (isHostAccount) socket.emit('join-requests', pendingList(room))
+
+  // Save attendance (one entry per join, closed when they leave)
+  // and send this meeting's earlier chat messages.
+  try {
+    await store.addParticipant(room, {
+      id: attendanceId,
+      user_id: account.id,
+      name,
+      joined_at: new Date()
+    })
+  } catch (saveError) {
+    console.error('Could not save attendance:', saveError.message)
+  }
+
+  try {
+    const history = (await store.getRecentMessages(room, MAX_CHAT_HISTORY)).map(message => ({
+      id: message.id,
+      senderId: null,
+      name: message.name,
+      message: message.message_text,
+      time: new Date(message.sent_at).getTime()
+    }))
+    socket.emit('chat-history', history)
+  } catch (historyError) {
+    console.error('Could not load chat history:', historyError.message)
+    socket.emit('chat-history', [])
+  }
+}
+
+function leaveRoom(socket, room) {
+  if (!room) return
+
+  socket.leave(room)
+
+  const users = roomUsers.get(room)
+  let roomIsEmpty = false
+
+  if (users) {
+    users.delete(socket.id)
+
+    if (users.size === 0) {
+      roomUsers.delete(room)
+      roomMeta.delete(room)
+      roomAdmitted.delete(room)
+      roomIsEmpty = true
+    } else {
+      roomUsers.set(room, users)
+    }
+  }
+
+  // Close this person's attendance entry.
+  const attendanceId = socket.data.attendanceId
+  socket.data.attendanceId = null
+  if (attendanceId) {
+    store.closeParticipant(room, attendanceId, roomIsEmpty)
+      .catch(saveError => console.error('Could not save leave time:', saveError.message))
+  }
+
+  // If the host leaves while recording, turn the indicator off.
+  const meta = roomMeta.get(room)
+  if (meta && meta.hostId === socket.id) {
+    meta.hostId = null
+    if (meta.recording) meta.recording = false
+    socket.to(room).emit('room-state', roomState(room))
+  }
+
+  socket.to(room).emit('user-left', socket.id)
+
+  if (socket.data.room === room) {
+    socket.data.room = null
   }
 }
 
@@ -841,74 +1171,87 @@ io.on('connection', socket => {
 
     if (!socket.connected) return
 
-    if (socket.data.room) {
-      leaveRoom(socket.data.room)
-    }
+    if (socket.data.room) leaveRoom(socket, socket.data.room)
+    stopWaiting(socket)
 
-    const users = roomUsers.get(room) || new Map()
-    const meta = roomMeta.get(room) || { hostId: null, recording: false }
-    meta.title = meeting.title
-
-    // The account that created the meeting is the host. If the host
-    // reconnects (new socket.id), they become host again.
     const isHostAccount = meeting.host_user_id === account.id
-    if (isHostAccount) meta.hostId = socket.id
-    roomMeta.set(room, meta)
 
-    const existingUsers = [...users.entries()].map(
-      ([id, user]) => publicUser(id, user)
-    )
+    if (!isHostAccount) {
+      // Invite-only meetings: the guest's e-mail must be on the host's list.
+      const email = String(account.email || '').toLowerCase()
+      if (meeting.access_type === 'invite' && !(meeting.invited_emails || []).includes(email)) {
+        return socket.emit('join-error', {
+          error: 'This meeting is invite-only and your email address is not on the guest list.'
+        })
+      }
 
-    socket.join(room)
-    socket.data.room = room
-    socket.data.name = name
-    socket.data.userId = account.id
+      // Everyone else needs the host's approval (unless already admitted).
+      if (!roomAdmitted.get(room)?.has(account.id)) {
+        const pending = roomPending.get(room) || new Map()
+        if (!pending.has(socket.id) && pending.size >= MAX_WAITING_PER_ROOM) {
+          return socket.emit('join-error', {
+            error: 'Too many people are waiting to join this meeting. Try again later.'
+          })
+        }
+        pending.set(socket.id, { name, userId: account.id })
+        roomPending.set(room, pending)
+        socket.data.waitingRoom = room
+        socket.data.pendingJoin = { meeting, account, name, payload }
 
-    const user = {
-      name,
-      userId: account.id,
-      micOn: payload?.micOn !== false,
-      cameraOn: payload?.cameraOn !== false,
-      screenSharing: false,
-      isHost: isHostAccount
+        socket.emit('waiting-for-host', {
+          title: meeting.title,
+          hostName: meeting.host_name
+        })
+        sendPendingToHost(room)
+        return
+      }
     }
 
-    users.set(socket.id, user)
-    roomUsers.set(room, users)
+    await enterRoom(socket, { room, meeting, account, name, payload })
+  })
 
-    const attendanceId = randomBytes(8).toString('hex')
-    socket.data.attendanceId = attendanceId
+  // ---- host decisions about the waiting room ----
+  socket.on('admit-user', async ({ id } = {}) => {
+    const room = hostedRoom(socket)
+    if (!room || typeof id !== 'string') return
 
-    socket.emit('room-state', { ...roomState(room), selfId: socket.id })
-    socket.emit('room-users', existingUsers)
-    socket.to(room).emit('user-joined', publicUser(socket.id, user))
+    const target = io.sockets.sockets.get(id)
+    const info = target?.data.pendingJoin
+    if (!target || !info || target.data.waitingRoom !== room) return
 
-    // Save attendance (one entry per join, closed when they leave)
-    // and send this meeting's earlier chat messages.
-    try {
-      await store.addParticipant(room, {
-        id: attendanceId,
-        user_id: account.id,
-        name,
-        joined_at: new Date()
-      })
-    } catch (saveError) {
-      console.error('Could not save attendance:', saveError.message)
-    }
+    stopWaiting(target)
+    await enterRoom(target, {
+      room,
+      meeting: info.meeting,
+      account: info.account,
+      name: info.name,
+      payload: info.payload
+    })
+  })
 
-    try {
-      const history = (await store.getRecentMessages(room, MAX_CHAT_HISTORY)).map(message => ({
-        id: message.id,
-        senderId: null,
-        name: message.name,
-        message: message.message_text,
-        time: new Date(message.sent_at).getTime()
-      }))
-      socket.emit('chat-history', history)
-    } catch (historyError) {
-      console.error('Could not load chat history:', historyError.message)
-      socket.emit('chat-history', [])
-    }
+  socket.on('deny-user', ({ id } = {}) => {
+    const room = hostedRoom(socket)
+    if (!room || typeof id !== 'string') return
+
+    const target = io.sockets.sockets.get(id)
+    if (!target || target.data.waitingRoom !== room) return
+
+    stopWaiting(target)
+    target.emit('join-denied')
+  })
+
+  // The host can remove someone who is already in the meeting.
+  socket.on('remove-user', ({ id } = {}) => {
+    const room = hostedRoom(socket)
+    if (!room || typeof id !== 'string' || id === socket.id) return
+
+    const target = io.sockets.sockets.get(id)
+    if (!target || target.data.room !== room) return
+
+    // Removed people must be approved again if they try to come back.
+    roomAdmitted.get(room)?.delete(target.data.userId)
+    leaveRoom(target, room)
+    target.emit('removed-from-meeting')
   })
 
   // Microphone / camera / screen-share status, shown to everyone.
@@ -936,13 +1279,21 @@ io.on('connection', socket => {
     io.to(room).emit('room-state', roomState(room))
   })
 
+  // WebRTC signalling is only passed between two people who are both
+  // inside the same meeting (so someone in the waiting room cannot use it).
   socket.on('signal', ({ to, data } = {}) => {
-    if (typeof to === 'string' && data) {
-      io.to(to).emit('signal', {
-        from: socket.id,
-        data
-      })
-    }
+    if (typeof to !== 'string' || !data) return
+
+    const room = socket.data.room
+    if (!room) return
+
+    const target = io.sockets.sockets.get(to)
+    if (!target || target.data.room !== room) return
+
+    target.emit('signal', {
+      from: socket.id,
+      data
+    })
   })
 
   socket.on('chat-message', ({ room, message } = {}) => {
@@ -982,55 +1333,14 @@ io.on('connection', socket => {
     }).catch(saveError => console.error('Could not save chat message:', saveError.message))
   })
 
-  function leaveRoom(room) {
-    if (!room) return
-
-    socket.leave(room)
-
-    const users = roomUsers.get(room)
-    let roomIsEmpty = false
-
-    if (users) {
-      users.delete(socket.id)
-
-      if (users.size === 0) {
-        roomUsers.delete(room)
-        roomMeta.delete(room)
-        roomIsEmpty = true
-      } else {
-        roomUsers.set(room, users)
-      }
-    }
-
-    // Close this person's attendance entry.
-    const attendanceId = socket.data.attendanceId
-    socket.data.attendanceId = null
-    if (attendanceId) {
-      store.closeParticipant(room, attendanceId, roomIsEmpty)
-        .catch(saveError => console.error('Could not save leave time:', saveError.message))
-    }
-
-    // If the host leaves while recording, turn the indicator off.
-    const meta = roomMeta.get(room)
-    if (meta && meta.hostId === socket.id) {
-      meta.hostId = null
-      if (meta.recording) meta.recording = false
-      socket.to(room).emit('room-state', roomState(room))
-    }
-
-    socket.to(room).emit('user-left', socket.id)
-
-    if (socket.data.room === room) {
-      socket.data.room = null
-    }
-  }
-
   socket.on('leave-room', ({ room } = {}) => {
-    leaveRoom(cleanCode(room) || socket.data.room)
+    stopWaiting(socket)
+    leaveRoom(socket, cleanCode(room) || socket.data.room)
   })
 
   socket.on('disconnect', () => {
-    leaveRoom(socket.data.room)
+    stopWaiting(socket)
+    leaveRoom(socket, socket.data.room)
   })
 })
 
@@ -1070,4 +1380,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(cloudStorageEnabled
     ? `Recordings: Google Cloud Storage bucket "${cloudStorageBucket}"`
     : 'Recordings: local disk (set GCS_BUCKET to use Cloud Storage)')
+  console.log(RETENTION_DAYS > 0
+    ? `Recordings are deleted automatically after ${RETENTION_DAYS} days`
+    : 'Recordings are kept forever (RECORDING_RETENTION_DAYS=0)')
+
+  setTimeout(removeExpiredRecordings, 30 * 1000)
+  setInterval(removeExpiredRecordings, 60 * 60 * 1000)
 })

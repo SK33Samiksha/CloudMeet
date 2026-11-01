@@ -150,7 +150,11 @@ Cloud SQL (MySQL) for application data:
 | Real-time chat, saved with the meeting (late joiners see earlier messages) | Works — `backend/data/meetings.json` |
 | Screen sharing to everyone, stop sharing | Works |
 | Host-only recording, visible "being recorded" banner | Works (records in the host's browser) |
-| Recording library: the host, everyone who attended, and anyone who enters the meeting code (e.g. students who missed the lecture) can watch; only the host can delete and see **who watched** (name and date) | Works — files in `backend/data/recordings/` |
+| Waiting room: guests with the code wait outside until the host presses **Admit** (or **Deny**); the host can also **remove** someone later | Works (version 2) — see "Meeting access and recording privacy" below |
+| Invite-only meetings: only the e-mail addresses the host lists may even ask to join | Works (version 2) |
+| Recording library: the host and the people the host let in can watch; someone who only knows the code must send a request that the host **approves**; only the host can delete and see **who watched** (name and date) | Works (version 2) — files in `backend/data/recordings/` or the bucket |
+| Recordings delete themselves after `RECORDING_RETENTION_DAYS` (default 30) | Works (version 2) — hourly clean-up job + optional bucket lifecycle rule |
+| Click a shared screen (or the expand button, or double-click any tile) to view it full screen | Works (version 2) |
 | Attendance history per account, on any device | Works — saved in `backend/data/meetings.json` |
 | Google Cloud SQL (MySQL) | Works when `DB_HOST` is set — connection `backend/db.js`, queries `backend/store.js`, schema `backend/db/schema.sql`; JSON files otherwise |
 | Google Cloud Storage for recordings | Works when `GCS_BUCKET` is set (falls back to local disk) |
@@ -170,6 +174,63 @@ every signed-in user.
 
 Note: `better-sqlite3` is listed in `backend/package.json`, but the current
 server stores data in JSON files, not SQLite.
+
+## Meeting access and recording privacy (version 2)
+
+**Who can enter a meeting**
+
+1. The host (the account that created it) always enters.
+2. Everyone else must be signed in. When they enter a valid code they only reach a
+   *waiting room*. The server does not connect them to the meeting (no video,
+   audio, chat or signalling) until the host presses **Admit**.
+3. When creating a meeting the host chooses:
+   - **Anyone with the code, after I approve them**, or
+   - **Invite only**: the host types e-mail addresses; people not on the list are
+     refused even before the waiting room.
+4. People the host admitted can reconnect after a refresh without asking again.
+   People the host removes must ask again.
+
+**Who can watch a recording**
+
+- The host, and people who were admitted to that meeting.
+- Anyone else: entering the meeting code only sends a *request*. The host sees it
+  on the Recordings page and presses **Approve** or **Decline**. Until then the
+  person cannot list or stream the recording (the server checks on every request).
+
+**Auto-delete of recordings**
+
+- Each recording gets an expiry date: `RECORDING_RETENTION_DAYS` after it was made
+  (default 30, set it to 7 for a week, `0` keeps recordings forever).
+- The backend checks every hour and deletes expired videos (bucket object and
+  database row). The recording card shows the date it will be deleted.
+- Safety net: add a lifecycle rule to the bucket so Google deletes anything that
+  is still there one day later:
+
+```bash
+gcloud storage buckets update gs://YOUR_BUCKET --lifecycle-file=backend/gcs-lifecycle.json
+# also make sure the bucket can never be made public:
+gcloud storage buckets update gs://YOUR_BUCKET --public-access-prevention
+```
+
+  (`backend/gcs-lifecycle.json` deletes objects older than 31 days. Change the
+  number if you change `RECORDING_RETENTION_DAYS`.)
+
+**Upgrading the deployed VM**
+
+```bash
+cd ~/CloudMeet && git pull
+cd backend && npm install            # nothing new, safe to run
+# optional: add RECORDING_RETENTION_DAYS=30 to backend/.env
+cd ../frontend && npm install && npm run build   # same build step as before
+sudo systemctl restart cloudmeet
+```
+
+The first start upgrades the Cloud SQL database automatically (adds the columns
+`meetings.access_type`, `meetings.invited_emails`, `recordings.expires_at` and
+the table `recording_requests`). If the log says it could not, run
+`backend/db/migration_v2.sql` once with a user that may alter tables.
+Recordings made before the upgrade have no expiry date and are kept until the
+host deletes them (the optional last line of `migration_v2.sql` gives them one).
 
 ## Security notes
 

@@ -3,7 +3,8 @@ import { io } from 'socket.io-client'
 import {
   Video, VideoOff, Mic, MicOff, MonitorUp, MessageCircle, Users,
   Copy, Plus, ArrowRight, PhoneOff, ShieldCheck, Cloud, X, Send,
-  Link2, Check, Sparkles, CalendarCheck, History, Clock, BarChart3, Circle, Square, Film, Play, Download, Trash2, UserRound, KeyRound
+  Link2, Check, Sparkles, CalendarCheck, History, Clock, BarChart3, Circle, Square, Film, Play, Download, Trash2, UserRound, KeyRound,
+  Maximize2, Minimize2, UserX, Lock, ZoomIn, ZoomOut
 } from 'lucide-react'
 
 // When these are empty, the browser uses the same address it opened
@@ -52,21 +53,219 @@ function initials(name) {
   return ((parts[0]?.[0] || '?') + (parts.length > 1 ? parts[parts.length - 1][0] : '')).toUpperCase()
 }
 
+const MAX_ZOOM = 8
+const DOUBLE_TAP_ZOOM = 3
+
+// Make a shared screen as sharp as possible. Zooming only enlarges the picture
+// that was received, so the sender must send a picture with enough detail.
+async function tuneVideoSender(sender, sharp) {
+  try {
+    const params = sender.getParameters()
+    if (!params.encodings || !params.encodings.length) params.encodings = [{}]
+    if (sharp) {
+      params.encodings[0].maxBitrate = 4000000
+      params.degradationPreference = 'maintain-resolution'
+    } else {
+      delete params.encodings[0].maxBitrate
+      params.degradationPreference = 'balanced'
+    }
+    await sender.setParameters(params)
+  } catch (error) {
+    console.warn('Could not tune the video sender:', error?.message)
+  }
+}
+
 // One tile per participant. The tile is shown even before the video arrives.
 // The <video> element stays mounted while a stream exists (only hidden when the
 // camera is off) so that the participant's AUDIO keeps playing.
+//
+// ZOOM works like the photo gallery on a phone:
+//  - mouse wheel / trackpad: zoom into the point under the cursor
+//  - double-click or double-tap: zoom in there (again: back to normal)
+//  - pinch with two fingers (shared screens)
+//  - drag to move around the zoomed picture
+//  - the + / - buttons zoom around the centre
+// Click a shared screen once (or use the expand button) for full screen.
 function VideoTile({ stream, name, muted = false, isLocal = false, showVideo = false, micOn = true, status = '', isHost = false, presenting = false, mirror = false }) {
   const ref = useRef(null)
+  const tileRef = useRef(null)
+  const [fullscreen, setFullscreen] = useState(false)
+  const [zoom, setZoom] = useState(1)
+  const [pan, setPan] = useState({ x: 0, y: 0 })
+  const [smooth, setSmooth] = useState(false)
+  // The refs hold the latest values for the event handlers below.
+  const zoomRef = useRef(1)
+  const panRef = useRef({ x: 0, y: 0 })
+  const pointersRef = useRef(new Map())
+  const pinchRef = useRef(null)
+  const gestureRef = useRef(null)
+  const lastTapRef = useRef(null)
+  const suppressClickRef = useRef(false)
+  const clickTimerRef = useRef(null)
+  const fullscreenRef = useRef(false)
+  const showVideoRef = useRef(false)
+  useEffect(() => { fullscreenRef.current = fullscreen }, [fullscreen])
+  useEffect(() => { showVideoRef.current = showVideo }, [showVideo])
+  useEffect(() => () => clearTimeout(clickTimerRef.current), [])
   useEffect(() => {
     const video = ref.current
     if (!video) return
     if (video.srcObject !== stream) video.srcObject = stream || null
     if (stream) video.play?.().catch(() => {})
   }, [stream])
-  return <div className={`video-tile ${isLocal ? 'local-tile' : ''} ${presenting ? 'presenting-tile' : ''}`}>
-    {stream && <video ref={ref} autoPlay playsInline muted={muted} className={`${showVideo ? '' : 'video-hidden'} ${mirror ? 'mirrored' : ''}`} />}
+  // Keep the button icon in step with the browser (Esc also leaves full screen).
+  useEffect(() => {
+    const onChange = () => setFullscreen(document.fullscreenElement === tileRef.current)
+    document.addEventListener('fullscreenchange', onChange)
+    return () => document.removeEventListener('fullscreenchange', onChange)
+  }, [])
+  function toggleFullscreen(event) {
+    event?.stopPropagation()
+    const tile = tileRef.current
+    if (!tile) return
+    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {})
+    else tile.requestFullscreen?.().catch(() => {})
+  }
+
+  // Keep the picture inside the tile while zoomed.
+  function clampPan(next, level) {
+    const rect = tileRef.current?.getBoundingClientRect()
+    if (!rect || level <= 1) return { x: 0, y: 0 }
+    const maxX = (rect.width * (level - 1)) / 2
+    const maxY = (rect.height * (level - 1)) / 2
+    return { x: Math.max(-maxX, Math.min(maxX, next.x)), y: Math.max(-maxY, Math.min(maxY, next.y)) }
+  }
+  function setView(level, nextPan, animate = false) {
+    const z = Math.max(1, Math.min(MAX_ZOOM, level))
+    const p = clampPan(nextPan, z)
+    zoomRef.current = z
+    panRef.current = p
+    setSmooth(animate)
+    setZoom(z)
+    setPan(p)
+  }
+  // Zoom by "factor" while the point under the cursor / fingers stays where it is.
+  function zoomAt(clientX, clientY, factor, animate = false) {
+    const rect = tileRef.current?.getBoundingClientRect()
+    if (!rect) return
+    const px = (clientX ?? rect.left + rect.width / 2) - (rect.left + rect.width / 2)
+    const py = (clientY ?? rect.top + rect.height / 2) - (rect.top + rect.height / 2)
+    const oldZoom = zoomRef.current
+    const newZoom = Math.max(1, Math.min(MAX_ZOOM, oldZoom * factor))
+    const ratio = newZoom / oldZoom
+    const old = panRef.current
+    setView(newZoom, { x: px - ratio * (px - old.x), y: py - ratio * (py - old.y) }, animate)
+  }
+  function zoomButton(event, factor) {
+    event.stopPropagation()
+    zoomAt(null, null, factor, true)
+  }
+  function resetZoom() { setView(1, { x: 0, y: 0 }, true) }
+  function doubleTap(x, y) {
+    clearTimeout(clickTimerRef.current)
+    if (zoomRef.current > 1.05) resetZoom()
+    else zoomAt(x, y, DOUBLE_TAP_ZOOM, true)
+  }
+
+  // Mouse wheel / trackpad zoom (needs a non-passive listener to stop the page scrolling).
+  useEffect(() => {
+    const tile = tileRef.current
+    if (!tile) return
+    const onWheel = event => {
+      if (!showVideoRef.current) return
+      event.preventDefault()
+      const step = Math.max(-100, Math.min(100, event.deltaY))
+      zoomAt(event.clientX, event.clientY, Math.exp(-step * 0.002), true)
+    }
+    tile.addEventListener('wheel', onWheel, { passive: false })
+    return () => tile.removeEventListener('wheel', onWheel)
+  }, [])
+
+  function pointerDown(event) {
+    if (!showVideoRef.current || event.button !== 0 || event.target.closest('button')) return
+    const pointers = pointersRef.current
+    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    if (pointers.size === 1) gestureRef.current = { total: 0, multi: false }
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()]
+      pinchRef.current = { dist: Math.hypot(a.x - b.x, a.y - b.y), x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+      if (gestureRef.current) gestureRef.current.multi = true
+    }
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+  }
+  function pointerMove(event) {
+    const pointers = pointersRef.current
+    const before = pointers.get(event.pointerId)
+    if (!before) return
+    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    if (pointers.size === 2) {
+      // Pinch: zoom around the middle between the two fingers, and follow them.
+      const [a, b] = [...pointers.values()]
+      const dist = Math.hypot(a.x - b.x, a.y - b.y)
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+      const last = pinchRef.current
+      if (last && last.dist > 0) {
+        panRef.current = { x: panRef.current.x + mid.x - last.x, y: panRef.current.y + mid.y - last.y }
+        zoomAt(mid.x, mid.y, dist / last.dist, false)
+      }
+      pinchRef.current = { dist, x: mid.x, y: mid.y }
+      return
+    }
+    if (pointers.size === 1) {
+      const dx = event.clientX - before.x
+      const dy = event.clientY - before.y
+      const gesture = gestureRef.current
+      if (gesture) gesture.total += Math.abs(dx) + Math.abs(dy)
+      // Drag to move around a zoomed picture.
+      if (zoomRef.current > 1 && gesture && gesture.total > 3) {
+        setView(zoomRef.current, { x: panRef.current.x + dx, y: panRef.current.y + dy }, false)
+      }
+    }
+  }
+  function pointerUp(event) {
+    const pointers = pointersRef.current
+    if (!pointers.has(event.pointerId)) return
+    pointers.delete(event.pointerId)
+    if (pointers.size < 2) pinchRef.current = null
+    if (pointers.size > 0) return
+    const gesture = gestureRef.current
+    const isTap = event.type === 'pointerup' && gesture && !gesture.multi && gesture.total <= 6
+    if (isTap) {
+      // Two quick taps in the same place = double tap = zoom.
+      const now = Date.now()
+      const last = lastTapRef.current
+      if (last && now - last.time < 300 && Math.hypot(event.clientX - last.x, event.clientY - last.y) < 30) {
+        lastTapRef.current = null
+        suppressClickRef.current = true
+        doubleTap(event.clientX, event.clientY)
+      } else {
+        lastTapRef.current = { time: now, x: event.clientX, y: event.clientY }
+      }
+    }
+    // The click event comes right after this; keep the gesture until then.
+    setTimeout(() => { gestureRef.current = null }, 0)
+  }
+  function tileClick() {
+    if (suppressClickRef.current) { suppressClickRef.current = false; return }
+    const gesture = gestureRef.current
+    if (gesture && (gesture.multi || gesture.total > 6)) return
+    if (!presenting || fullscreenRef.current || zoomRef.current > 1.05) return
+    // Wait a moment: a second tap means "zoom", not "full screen".
+    clearTimeout(clickTimerRef.current)
+    clickTimerRef.current = setTimeout(() => toggleFullscreen(), 320)
+  }
+
+  return <div ref={tileRef} className={`video-tile ${isLocal ? 'local-tile' : ''} ${presenting ? 'presenting-tile' : ''} ${fullscreen ? 'is-fullscreen' : ''}`} onClick={tileClick} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} style={zoom > 1 || presenting ? { touchAction: 'none', ...(zoom > 1 ? { cursor: 'grab' } : {}) } : undefined}>
+    {stream && <video ref={ref} autoPlay playsInline muted={muted} className={`${showVideo ? '' : 'video-hidden'} ${mirror ? 'mirrored' : ''}`} style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${mirror ? -zoom : zoom}, ${zoom})`, transition: smooth ? 'transform .18s ease-out' : 'none' }} />}
     {!showVideo && <div className="avatar">{initials(name)}</div>}
     {status && <span className="tile-status">{status}</span>}
+    {showVideo && <div className="tile-tools">
+      <button type="button" onClick={event => zoomButton(event, 1 / 1.5)} disabled={zoom <= 1} title="Zoom out" aria-label="Zoom out"><ZoomOut size={15}/></button>
+      <button type="button" className="zoom-level" onClick={event => { event.stopPropagation(); resetZoom() }} title="Reset zoom" aria-label="Reset zoom">{Math.round(zoom * 100)}%</button>
+      <button type="button" onClick={event => zoomButton(event, 1.5)} disabled={zoom >= MAX_ZOOM} title="Zoom in" aria-label="Zoom in"><ZoomIn size={15}/></button>
+      <button type="button" onClick={toggleFullscreen} title={fullscreen ? 'Exit full screen' : 'Full screen'} aria-label={fullscreen ? 'Exit full screen' : 'Full screen'}>{fullscreen ? <Minimize2 size={15}/> : <Maximize2 size={15}/>}</button>
+    </div>}
+    {showVideo && zoom === 1 && <span className="tile-hint">Scroll or double-click to zoom{presenting ? ' · click for full screen' : ''}</span>}
     <div className="tile-label"><span className="live-dot" />{name}{isLocal ? ' (You)' : ''}{isHost && <span className="host-chip">Host</span>}{presenting && <span className="host-chip">Presenting</span>}</div>
     {!micOn && <span className="muted-indicator" title="Microphone muted"><MicOff size={14}/></span>}
   </div>
@@ -167,6 +366,15 @@ export default function App() {
   const [status, setStatus] = useState('Connecting to meeting server…')
   const [copied, setCopied] = useState(false)
   const [notice, setNotice] = useState('')
+  // Waiting room: guest side (waitingForHost) and host side (joinRequests).
+  const [waitingForHost, setWaitingForHost] = useState(false)
+  const [joinRequests, setJoinRequests] = useState([])
+  const joinRequestIdsRef = useRef(new Set())
+  const [meetingAccess, setMeetingAccess] = useState('ask')
+  const [newAccessType, setNewAccessType] = useState('ask')
+  const [newInvitedEmails, setNewInvitedEmails] = useState('')
+  // People who asked the host for access to recordings.
+  const [recordingRequests, setRecordingRequests] = useState([])
   const socketRef = useRef(null)
   const streamRef = useRef(null)
   const peersRef = useRef({})
@@ -252,6 +460,7 @@ export default function App() {
     streamRef.current?.getTracks().forEach(t => t.stop()); streamRef.current = null; setLocalStream(null)
     screenStreamRef.current?.getTracks().forEach(t => t.stop()); screenStreamRef.current = null; setScreenStream(null)
     setParticipants([]); setJoined(false); setIsHost(false); setRoomRecording(false)
+    setWaitingForHost(false); setJoinRequests([]); joinRequestIdsRef.current = new Set()
     if (mustSignOut) { signOut(message); return }
     setScreen('home')
     flash(message, 7000)
@@ -276,7 +485,21 @@ export default function App() {
     // Earlier messages of this meeting, so late joiners can read them.
     socket.on('chat-history', history => setMessages(Array.isArray(history) ? history : []))
     socket.on('join-error', ({ error, signOut: mustSignOut } = {}) => abortMeeting(error || 'Could not join the meeting.', mustSignOut))
+    // Waiting room events
+    socket.on('waiting-for-host', () => setWaitingForHost(true))
+    socket.on('join-denied', () => abortMeeting('The host did not let you into the meeting.'))
+    socket.on('removed-from-meeting', () => abortMeeting('The host removed you from the meeting.'))
+    socket.on('join-requests', list => {
+      const next = Array.isArray(list) ? list : []
+      const known = joinRequestIdsRef.current
+      const added = next.filter(person => !known.has(person.id))
+      joinRequestIdsRef.current = new Set(next.map(person => person.id))
+      if (added.length) flash(`${added[0].name || 'Someone'} is asking to join`, 4000)
+      setJoinRequests(next)
+    })
     socket.on('room-state', state => {
+      setWaitingForHost(false)
+      if (state.accessType) setMeetingAccess(state.accessType)
       if (state.selfId) selfIdRef.current = state.selfId
       if (state.title) setMeetingTitle(state.title)
       setIsHost(Boolean(state.hostId) && state.hostId === selfIdRef.current)
@@ -407,6 +630,11 @@ export default function App() {
         console.warn('Could not load shared recordings', err)
         setRecordingsError(`Could not load shared recordings: ${err.message}`)
       }
+      // Requests from people who want to watch recordings of meetings I host.
+      try {
+        const requestData = await apiFetch('/api/recordings/requests')
+        setRecordingRequests(requestData.requests || [])
+      } catch { setRecordingRequests([]) }
     }
     try {
       const local = await getRecordings()
@@ -458,10 +686,22 @@ export default function App() {
       const data = await apiFetch('/api/recordings/access', { method: 'POST', json: { code } })
       await refreshRecordings()
       setRecordingCode('')
-      setRecordingCodeMessage(data.recordingCount
+      setRecordingCodeMessage(data.status === 'pending'
+        ? `Request sent to ${data.meeting.hostName}. "${data.meeting.title}" will appear in your library once the host approves it.`
+        : data.recordingCount
         ? `Added "${data.meeting.title}" (${data.meeting.id}) by ${data.meeting.hostName}: ${data.recordingCount} recording${data.recordingCount > 1 ? 's' : ''} now in your library.`
         : `"${data.meeting.title}" (${data.meeting.id}) has no recording yet. It will appear here automatically once the host records it.`)
     } catch (err) { setRecordingsError(err.message) } finally { setRecordingCodeBusy(false) }
+  }
+
+  // The host approves or declines someone who asked to watch recordings.
+  async function answerRecordingRequest(request, decision) {
+    setRecordingCodeMessage(''); setRecordingsError('')
+    try {
+      await apiFetch(`/api/recordings/requests/${request.meetingId}/${request.userId}/${decision}`, { method: 'POST' })
+      setRecordingRequests(prev => prev.filter(item => !(item.meetingId === request.meetingId && item.userId === request.userId)))
+      setRecordingCodeMessage(decision === 'approve' ? `${request.name} can now watch the recordings of "${request.title}".` : `The request from ${request.name} was declined.`)
+    } catch (err) { setRecordingsError(err.message) }
   }
 
   function openMissedRecording(code) {
@@ -777,17 +1017,18 @@ export default function App() {
   async function startMeeting(code, host = false) {
     if (meetingBusy) return
     // 1. Ask the server to create the meeting (host), or check the code (join).
-    let finalCode, title
+    let finalCode, title, access = 'ask'
     setMeetingBusy(true)
     try {
       if (host) {
-        const data = await apiFetch('/api/meetings', { method: 'POST', json: { title: newMeetingTitle } })
-        finalCode = data.meeting.id; title = data.meeting.title
+        if (newAccessType === 'invite' && !newInvitedEmails.trim()) throw new Error('Type at least one email address for an invite-only meeting.')
+        const data = await apiFetch('/api/meetings', { method: 'POST', json: { title: newMeetingTitle, accessType: newAccessType, invitedEmails: newInvitedEmails } })
+        finalCode = data.meeting.id; title = data.meeting.title; access = data.meeting.accessType || 'ask'
       } else {
         const wanted = cleanMeetingCode(code)
         if (!wanted) throw new Error('Please enter a meeting code first.')
         const data = await apiFetch(`/api/meetings/${wanted}`)
-        finalCode = data.meeting.id; title = data.meeting.title
+        finalCode = data.meeting.id; title = data.meeting.title; access = data.meeting.accessType || 'ask'
       }
     } catch (err) {
       flash(err.message, 6000)
@@ -797,7 +1038,9 @@ export default function App() {
     setMeetingBusy(false)
     clearInviteFromUrl(); setInviteRoom('')
     setMeetingTitle(title || 'Team meeting')
-    setNewMeetingTitle('')
+    setMeetingAccess(access)
+    setNewMeetingTitle(''); setNewAccessType('ask'); setNewInvitedEmails('')
+    setWaitingForHost(false); setJoinRequests([]); joinRequestIdsRef.current = new Set()
 
     // 2. Start camera/microphone, then join the live room.
     setIsHost(false) // confirmed by the server in 'room-state'
@@ -848,6 +1091,21 @@ export default function App() {
     setScreen('meeting')
   }
 
+  // Host: let a waiting person in, or keep them out.
+  function answerJoin(eventName, id) {
+    socketRef.current?.emit(eventName, { id })
+    setJoinRequests(prev => prev.filter(person => person.id !== id))
+  }
+  function admitEveryone() {
+    joinRequests.forEach(person => socketRef.current?.emit('admit-user', { id: person.id }))
+    setJoinRequests([])
+  }
+  // Host: remove someone who is already in the meeting.
+  function removePerson(person) {
+    if (!window.confirm(`Remove ${person.name || 'this person'} from the meeting?`)) return
+    socketRef.current?.emit('remove-user', { id: person.id })
+  }
+
   function sendMediaState() {
     socketRef.current?.emit('media-state', currentMediaState())
   }
@@ -878,22 +1136,27 @@ export default function App() {
   async function shareScreen() {
     try {
       if (!navigator.mediaDevices?.getDisplayMedia) { flash('Screen sharing requires a supported browser on HTTPS.', 4500); return }
-      const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+      // Ask for the full detail of the screen (up to 4K) so zooming in shows real, readable text.
+      const display = await navigator.mediaDevices.getDisplayMedia({ video: { width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 15, max: 30 } }, audio: false })
       const screenTrack = display.getVideoTracks()[0]
       if (!screenTrack) return
+      // "detail" tells the browser to keep text sharp instead of keeping motion smooth.
+      try { screenTrack.contentHint = 'detail' } catch {}
       screenStreamRef.current = display
       setScreenStream(display)
       let sent = 0
       for (const [peerId, pc] of Object.entries(peersRef.current)) {
         try {
           const sender = pc.getSenders().find(item => item.track?.kind === 'video')
-          if (sender) { await sender.replaceTrack(screenTrack); sent++; continue }
+          if (sender) { await sender.replaceTrack(screenTrack); await tuneVideoSender(sender, true); sent++; continue }
           // No camera was being sent: turn the receive-only video slot into
           // send+receive and renegotiate with this peer.
           const transceiver = findVideoTransceiver(pc)
           if (transceiver) { transceiver.direction = 'sendrecv'; await transceiver.sender.replaceTrack(screenTrack) }
           else pc.addTrack(screenTrack, display)
           await sendOffer(peerId, pc)
+          const newSender = pc.getSenders().find(item => item.track === screenTrack)
+          if (newSender) await tuneVideoSender(newSender, true)
           sent++
         } catch (error) { console.warn('Could not share screen with', peerId, error) }
       }
@@ -912,7 +1175,9 @@ export default function App() {
     const cameraTrack = streamRef.current?.getVideoTracks()[0] || null
     await Promise.all(Object.values(peersRef.current).map(async pc => {
       const sender = pc.getSenders().find(item => item.track && item.track === screenTrack)
-      if (sender) { try { await sender.replaceTrack(cameraTrack) } catch (error) { console.warn('Could not restore camera track:', error) } }
+      if (sender) {
+        try { await sender.replaceTrack(cameraTrack); await tuneVideoSender(sender, false) } catch (error) { console.warn('Could not restore camera track:', error) }
+      }
     }))
     display.getTracks().forEach(track => track.stop())
     screenStreamRef.current = null
@@ -960,6 +1225,7 @@ export default function App() {
     streamRef.current?.getTracks().forEach(t => t.stop()); streamRef.current = null; setLocalStream(null)
     screenStreamRef.current?.getTracks().forEach(t => t.stop()); screenStreamRef.current = null; setScreenStream(null)
     setIsHost(false); setRoomRecording(false)
+    setWaitingForHost(false); setJoinRequests([]); joinRequestIdsRef.current = new Set()
     setParticipants([]); setJoined(false); setChatOpen(false); setPeopleOpen(false); setScreen('home')
   }
 
@@ -1008,9 +1274,11 @@ export default function App() {
         <div className="header-right"><span className="connection-status">{status}</span><span className="people-count"><Users size={16}/>{participants.length + 1}</span></div>
       </header>
       {notice && <div className="toast">{notice}</div>}
+      {waitingForHost && <div className="waiting-overlay" role="alertdialog" aria-live="polite"><div className="waiting-card"><div className="waiting-icon"><Clock size={26}/></div><h2>Asking to join…</h2><p>The host of <b>{meetingTitle}</b> has been told you are here. You will enter as soon as they let you in.</p><button className="button button-outline" onClick={leaveMeeting}>Cancel</button></div></div>}
+      {isHost && joinRequests.length > 0 && <div className="join-requests" role="dialog" aria-label="People waiting to join"><div className="join-requests-title"><b>Waiting to join</b><span>{joinRequests.length}</span></div>{joinRequests.map(person => <div className="join-request" key={person.id}><div className="chat-avatar">{initials(person.name)}</div><span className="join-request-name">{person.name}</span><button className="button button-primary" onClick={() => answerJoin('admit-user', person.id)}>Admit</button><button className="button button-outline" onClick={() => answerJoin('deny-user', person.id)}>Deny</button></div>)}{joinRequests.length > 1 && <button className="button button-light full" onClick={admitEveryone}>Admit all</button>}</div>}
       <main className={`meeting-main ${chatOpen ? 'with-chat' : ''}`}>
         <section className="video-stage">
-          <div className="stage-topline"><div><span className="eyebrow">LIVE SESSION</span><h1>{meetingTitle}</h1></div><div className="stage-badges"><span className="secure-badge"><ShieldCheck size={14}/> Private room code</span><span className="secure-badge"><Users size={14}/>{participants.length + 1} participant{participants.length ? 's' : ''}</span></div></div>
+          <div className="stage-topline"><div><span className="eyebrow">LIVE SESSION</span><h1>{meetingTitle}</h1></div><div className="stage-badges"><span className="secure-badge"><Lock size={14}/> {meetingAccess === 'invite' ? 'Invite-only meeting' : 'Host approves joiners'}</span><span className="secure-badge"><Users size={14}/>{participants.length + 1} participant{participants.length ? 's' : ''}</span></div></div>
           <section aria-label="Meeting participants" style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap',padding:'10px 12px',margin:'0 0 12px',border:'1px solid #e5e7eb',borderRadius:12,background:'#fff'}}>
             <button type="button" onClick={() => setPeopleOpen(v => !v)} aria-expanded={peopleOpen} style={{border:0,background:'transparent',fontWeight:700,fontSize:13,color:'#374151',cursor:'pointer',padding:'5px 0'}}>People ({participants.length + 1})</button>
             <span style={{display:'inline-flex',alignItems:'center',gap:7,padding:'6px 10px',borderRadius:999,background:'#eff6ff',color:'#1d4ed8',fontSize:13}}>
@@ -1063,7 +1331,7 @@ export default function App() {
           <div className="chat-heading"><div><h2>People</h2><p>{participants.length + 1} {participants.length ? 'people' : 'person'} in this meeting</p></div><button className="icon-button" onClick={() => setPeopleOpen(false)} aria-label="Close people panel"><X size={18}/></button></div>
           <div className="chat-messages">
             <div className="chat-message person-row"><div className="chat-avatar">{initials(name || 'Guest')}</div><div className="person-info"><div className="chat-meta"><b>{name || 'Guest'} (You)</b>{isHost && <span className="host-chip light">Host</span>}</div><p>{screenStream ? 'Presenting' : 'In the meeting'}</p></div><div className="person-icons">{micOn ? <Mic size={15}/> : <MicOff size={15} className="icon-off"/>}{cameraOn ? <Video size={15}/> : <VideoOff size={15} className="icon-off"/>}</div></div>
-            {participants.map(person => <div className="chat-message person-row" key={person.id}><div className="chat-avatar">{initials(person.name || 'Participant')}</div><div className="person-info"><div className="chat-meta"><b>{person.name || 'Participant'}</b>{person.isHost && <span className="host-chip light">Host</span>}</div><p>{person.screenSharing ? 'Presenting' : connectionLabel(person.id)}</p></div><div className="person-icons">{person.micOn !== false ? <Mic size={15}/> : <MicOff size={15} className="icon-off"/>}{person.cameraOn !== false ? <Video size={15}/> : <VideoOff size={15} className="icon-off"/>}</div></div>)}
+            {participants.map(person => <div className="chat-message person-row" key={person.id}><div className="chat-avatar">{initials(person.name || 'Participant')}</div><div className="person-info"><div className="chat-meta"><b>{person.name || 'Participant'}</b>{person.isHost && <span className="host-chip light">Host</span>}</div><p>{person.screenSharing ? 'Presenting' : connectionLabel(person.id)}</p></div><div className="person-icons">{person.micOn !== false ? <Mic size={15}/> : <MicOff size={15} className="icon-off"/>}{person.cameraOn !== false ? <Video size={15}/> : <VideoOff size={15} className="icon-off"/>}{isHost && <button type="button" className="icon-button small remove-person" title="Remove from meeting" aria-label={`Remove ${person.name || 'participant'}`} onClick={() => removePerson(person)}><UserX size={14}/></button>}</div></div>)}
           </div>
         </aside>}
         {chatOpen && <aside className="chat-panel">
@@ -1109,14 +1377,15 @@ export default function App() {
     <main className="attendance-page recordings-page">
       <div className="attendance-heading"><span className="eyebrow">MEETING LIBRARY</span><h1>Recordings</h1><p>Recordings of meetings you hosted or attended, and of meetings you added with a code.</p></div>
       <form className="attendance-history missed-form" onSubmit={unlockRecordings}>
-        <div><span className="eyebrow">MISSED A MEETING?</span><h2>Find a recording with the meeting code</h2><p>Enter the code (or open the invite link) your host shared. The recording is added to your library.</p></div>
-        <div className="missed-input"><input value={recordingCode} onChange={e => setRecordingCode(cleanMeetingCode(e.target.value))} placeholder="e.g. A1B2C3" maxLength={12} aria-label="Meeting code"/><button className="button button-primary" type="submit" disabled={recordingCodeBusy}>{recordingCodeBusy ? 'Checking…' : 'Find recording'}</button></div>
+        <div><span className="eyebrow">MISSED A MEETING?</span><h2>Ask the host for a recording</h2><p>Enter the meeting code your host shared. The host must approve your request before you can watch anything.</p></div>
+        <div className="missed-input"><input value={recordingCode} onChange={e => setRecordingCode(cleanMeetingCode(e.target.value))} placeholder="e.g. A1B2C3" maxLength={12} aria-label="Meeting code"/><button className="button button-primary" type="submit" disabled={recordingCodeBusy}>{recordingCodeBusy ? 'Sending…' : 'Request access'}</button></div>
       </form>
+      {recordingRequests.length > 0 && <section className="attendance-history access-requests"><div><span className="eyebrow">ACCESS REQUESTS</span><h2>People asking to watch your recordings</h2></div>{recordingRequests.map(request => <div className="access-request" key={`${request.meetingId}-${request.userId}`}><div className="access-request-info"><b>{request.name}</b><span>wants to watch “{request.title}” (meeting {request.meetingId})</span></div><div className="access-request-actions"><button className="button button-primary" onClick={() => answerRecordingRequest(request, 'approve')}>Approve</button><button className="button button-outline" onClick={() => answerRecordingRequest(request, 'deny')}>Decline</button></div></div>)}</section>}
       {recordingCodeMessage && <div className="profile-success" role="status"><Check size={16}/> {recordingCodeMessage}</div>}
       {recordingsError && <div className="auth-error page-error" role="alert">{recordingsError}</div>}
       {recordingUrl && <section className="recording-player"><div className="attendance-history-title"><h2>Preview recording</h2><button className="button button-outline" onClick={() => { URL.revokeObjectURL(recordingUrl); setRecordingUrl('') }}>Close player</button></div><video controls autoPlay src={recordingUrl}/></section>}
       <section className="attendance-history" id="recording-list"><div className="attendance-history-title"><div><span className="eyebrow">SHARED LIBRARY</span><h2>Class recordings</h2></div><button className="button button-outline" onClick={refreshRecordings}><History size={16}/> Refresh</button></div>
-      {recordings.length ? <div className="recording-grid">{recordings.map(item => <article className="recording-card" key={item.id}><div className="recording-thumb"><Film size={34}/><span>WEBM VIDEO</span></div><div className="recording-card-body"><h3>{item.title || `Meeting ${item.room}`}</h3><p>Room {item.room} · {new Date(item.createdAt).toLocaleString()}{item.hostName ? ` · by ${item.hostName}` : ''}{!item.shared ? ' · only in this browser' : ''}</p><p>{Math.floor((item.durationSeconds || 0) / 60)}m {(item.durationSeconds || 0) % 60}s · {((item.sizeBytes || item.blob?.size || 0) / (1024 * 1024)).toFixed(1)} MB</p><div className="recording-actions"><button className="button button-primary" onClick={() => openRecording(item)}><Play size={15}/> Play</button><a className="button button-outline" href={item.url ? item.url : URL.createObjectURL(item.blob)} download={`CloudMeet-${item.room}-${item.createdAt}.webm`}><Download size={15}/> Download</a>{item.shared && item.hostId === currentUser?.id && <button className={`button button-outline ${viewersFor === item.id ? 'viewers-open' : ''}`} onClick={() => toggleViewers(item)}><Users size={15}/> Viewers ({item.viewCount || 0})</button>}{(!item.shared || item.hostId === currentUser?.id) && <button className="icon-button delete-recording" onClick={() => removeRecording(item.id)} title="Delete recording"><Trash2 size={17}/></button>}</div>{viewersFor === item.id && <div className="viewers-list">
+      {recordings.length ? <div className="recording-grid">{recordings.map(item => <article className="recording-card" key={item.id}><div className="recording-thumb"><Film size={34}/><span>WEBM VIDEO</span></div><div className="recording-card-body"><h3>{item.title || `Meeting ${item.room}`}</h3><p>Room {item.room} · {new Date(item.createdAt).toLocaleString()}{item.hostName ? ` · by ${item.hostName}` : ''}{!item.shared ? ' · only in this browser' : ''}{item.expiresAt ? ` · deleted automatically on ${new Date(item.expiresAt).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' })}` : ''}</p><p>{Math.floor((item.durationSeconds || 0) / 60)}m {(item.durationSeconds || 0) % 60}s · {((item.sizeBytes || item.blob?.size || 0) / (1024 * 1024)).toFixed(1)} MB</p><div className="recording-actions"><button className="button button-primary" onClick={() => openRecording(item)}><Play size={15}/> Play</button><a className="button button-outline" href={item.url ? item.url : URL.createObjectURL(item.blob)} download={`CloudMeet-${item.room}-${item.createdAt}.webm`}><Download size={15}/> Download</a>{item.shared && item.hostId === currentUser?.id && <button className={`button button-outline ${viewersFor === item.id ? 'viewers-open' : ''}`} onClick={() => toggleViewers(item)}><Users size={15}/> Viewers ({item.viewCount || 0})</button>}{(!item.shared || item.hostId === currentUser?.id) && <button className="icon-button delete-recording" onClick={() => removeRecording(item.id)} title="Delete recording"><Trash2 size={17}/></button>}</div>{viewersFor === item.id && <div className="viewers-list">
         <b>Who watched this recording</b>
         {viewersError ? <p className="viewers-error">{viewersError}</p>
           : !viewersList ? <p>Loading…</p>
@@ -1124,7 +1393,7 @@ export default function App() {
           : <ul>{viewersList.map(v => <li key={v.name + v.watchedAt}><span>{v.name}</span><span>{new Date(v.watchedAt).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' })}</span></li>)}</ul>}
       </div>}</div></article>)}</div> : <div className="attendance-empty"><Film size={32}/><h3>No recordings yet</h3><p>Join a meeting, click Record, then stop recording or leave the meeting. Your video will appear here.</p><button className="button button-primary" onClick={() => setScreen('home')}>Go to meetings <ArrowRight size={16}/></button></div>}
       </section>
-      <p className="attendance-disclaimer">Recordings are stored by the CloudMeet backend. They can be watched by the host, by everyone who attended, and by anyone who enters the meeting code here. Only the host can delete a recording. In the cloud version the video files move to Google Cloud Storage.</p>
+      <p className="attendance-disclaimer">Recordings are private. They can be watched by the host, by people the host let into the meeting, and by people the host approves here. Knowing a meeting code is not enough. Only the host can delete a recording, and every recording is deleted automatically after a set number of days. The video files are kept in a private Google Cloud Storage bucket.</p>
     </main>
   </div>
 
@@ -1209,7 +1478,7 @@ export default function App() {
       <section className="start-section" id="start-panel">
         <div className="section-heading"><span className="eyebrow">GET STARTED</span><h2>Your next meeting starts here.</h2><p>Create a new room or join your team's existing meeting.</p></div>
         <div className="start-grid">
-          <div className="start-card create-card"><div className="card-icon blue"><Plus size={22}/></div><h3>Create a meeting</h3><p>Start a new room and invite people with a meeting code.</p><label>Meeting title (optional)</label><input value={newMeetingTitle} onChange={e => setNewMeetingTitle(e.target.value)} placeholder="e.g. Cloud Lab review" maxLength={80}/><label>Your display name</label><input value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name" maxLength={32}/><button className="button button-primary full" disabled={meetingBusy} onClick={() => startMeeting('', true)}><Video size={17}/> {meetingBusy ? 'Please wait…' : 'Create meeting'} <ArrowRight size={16}/></button></div>
+          <div className="start-card create-card"><div className="card-icon blue"><Plus size={22}/></div><h3>Create a meeting</h3><p>Start a new room and invite people with a meeting code.</p><label>Meeting title (optional)</label><input value={newMeetingTitle} onChange={e => setNewMeetingTitle(e.target.value)} placeholder="e.g. Cloud Lab review" maxLength={80}/><label>Who can join?</label><select className="access-select" value={newAccessType} onChange={e => setNewAccessType(e.target.value)}><option value="ask">Anyone with the code, after I approve them</option><option value="invite">Invite only (only the emails I list)</option></select>{newAccessType === 'invite' && <><label>Invited email addresses</label><textarea className="access-emails" value={newInvitedEmails} onChange={e => setNewInvitedEmails(e.target.value)} placeholder="one@example.com, two@example.com" rows={3}/></>}<label>Your display name</label><input value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name" maxLength={32}/><button className="button button-primary full" disabled={meetingBusy} onClick={() => startMeeting('', true)}><Video size={17}/> {meetingBusy ? 'Please wait…' : 'Create meeting'} <ArrowRight size={16}/></button></div>
           <div className={`start-card join-card ${inviteRoom ? 'invited' : ''}`} id="join-card"><div className="card-icon purple"><Link2 size={21}/></div><h3>Join a meeting</h3><p>{inviteRoom ? <>You were invited to meeting <b>{inviteRoom}</b>. Check your name and click Join.</> : 'Have a code or invite link? Enter the code below to join your team.'}</p><label>Your display name</label><input value={name} onChange={e => setName(e.target.value)} placeholder="Enter your name" maxLength={32}/><label>Meeting code</label><input value={meetingCode} onChange={e => setMeetingCode(cleanMeetingCode(e.target.value))} placeholder="e.g. A1B2C3" maxLength={12}/><button className="button button-dark full" disabled={meetingBusy} onClick={() => startMeeting(meetingCode, false)}><ArrowRight size={17}/> {meetingBusy ? 'Checking…' : 'Join meeting'}</button>{inviteRoom && <button type="button" className="missed-link" onClick={() => openMissedRecording(inviteRoom)}><Film size={14}/> Missed this meeting? Watch its recording</button>}</div>
         </div>
         {notice && <div className="home-notice">{notice}<button onClick={() => setNotice('')}><X size={15}/></button></div>}

@@ -23,6 +23,17 @@ function newMeetingCode() {
 
 const toMs = value => (value ? new Date(value).getTime() : null)
 
+// Invited e-mail addresses are saved as JSON text in MySQL.
+const parseEmails = value => {
+  if (Array.isArray(value)) return value
+  try {
+    const list = JSON.parse(value || '[]')
+    return Array.isArray(list) ? list : []
+  } catch {
+    return []
+  }
+}
+
 // ======================================================================
 // JSON FILE STORE (same behaviour as before the MySQL integration)
 // ======================================================================
@@ -65,7 +76,9 @@ function createJsonStore() {
     host_user_id: meeting.host_user_id,
     host_name: meeting.host_name,
     created_at: meeting.created_at,
-    status: meeting.status
+    status: meeting.status,
+    access_type: meeting.access_type || 'ask',
+    invited_emails: meeting.invited_emails || []
   }
 
   return {
@@ -105,7 +118,7 @@ function createJsonStore() {
     },
 
     // ---- meetings ----
-    async createMeeting({ title, host_user_id, host_name }) {
+    async createMeeting({ title, host_user_id, host_name, access_type = 'ask', invited_emails = [] }) {
       const meetings = read(MEETINGS_FILE)
       let id
       do { id = newMeetingCode() } while (findMeeting(id, meetings))
@@ -113,7 +126,8 @@ function createJsonStore() {
         id, title, host_user_id, host_name,
         created_at: new Date().toISOString(),
         status: 'scheduled',
-        participants: [], viewers: [], messages: []
+        access_type, invited_emails,
+        participants: [], viewers: [], messages: [], recording_requests: []
       }
       meetings.push(meeting)
       write(MEETINGS_FILE, meetings)
@@ -224,6 +238,56 @@ function createJsonStore() {
     },
     async deleteRecording(id) {
       write(RECORDINGS_FILE, read(RECORDINGS_FILE).filter(item => item.id !== id))
+    },
+    async listExpiredRecordings(now = new Date()) {
+      return read(RECORDINGS_FILE).filter(item => item.expires_at && new Date(item.expires_at) <= now)
+    },
+
+    // ---- recording access requests (the host decides) ----
+    async addRecordingRequest(code, userId, name) {
+      const meeting = findMeeting(code)
+      if (!meeting) return null
+      if (attended(meeting, userId) || (meeting.viewers || []).includes(userId)) {
+        return { meeting: publicMeeting(meeting), status: 'approved' }
+      }
+      updateMeeting(code, item => {
+        item.recording_requests = item.recording_requests || []
+        const now = new Date().toISOString()
+        const existing = item.recording_requests.find(request => request.user_id === userId)
+        if (existing) Object.assign(existing, { name, status: 'pending', requested_at: now })
+        else item.recording_requests.push({ user_id: userId, name, status: 'pending', requested_at: now })
+      })
+      return { meeting: publicMeeting(meeting), status: 'pending' }
+    },
+    async listRecordingRequests(hostId) {
+      return read(MEETINGS_FILE)
+        .filter(meeting => meeting.host_user_id === hostId)
+        .flatMap(meeting => (meeting.recording_requests || [])
+          .filter(request => request.status === 'pending')
+          .map(request => ({
+            meeting_id: meeting.id,
+            title: meeting.title,
+            user_id: request.user_id,
+            name: request.name,
+            requested_at: request.requested_at
+          })))
+    },
+    async resolveRecordingRequest(code, userId, hostId, approve) {
+      const meeting = findMeeting(code)
+      if (!meeting || meeting.host_user_id !== hostId) return false
+      let found = false
+      updateMeeting(code, item => {
+        const request = (item.recording_requests || [])
+          .find(entry => entry.user_id === userId && entry.status === 'pending')
+        if (!request) return
+        found = true
+        request.status = approve ? 'approved' : 'denied'
+        if (approve) {
+          item.viewers = item.viewers || []
+          if (!item.viewers.includes(userId)) item.viewers.push(userId)
+        }
+      })
+      return found
     }
   }
 }
@@ -248,7 +312,9 @@ async function createMysqlStore() {
     host_user_id: Number(row.host_user_id),
     host_name: row.host_name,
     created_at: row.created_at,
-    status: row.status
+    status: row.status,
+    access_type: row.access_type || 'ask',
+    invited_emails: parseEmails(row.invited_emails)
   }
   const recordingRow = row => row && {
     id: row.id,
@@ -262,6 +328,7 @@ async function createMysqlStore() {
     host_name: row.host_name,
     storage: row.storage,
     gcs_object: row.gcs_object || undefined,
+    expires_at: row.expires_at || null,
     view_count: row.view_count !== undefined ? Number(row.view_count) : undefined
   }
   const userRow = row => row && {
@@ -277,6 +344,44 @@ async function createMysqlStore() {
     [code, userId, code, userId]
   ))
 
+  // Upgrades an existing CloudMeet database to the version 2 layout:
+  // waiting room / invite-only meetings, recording expiry and recording
+  // access requests. It is safe to run on every start (it only adds what is
+  // missing). The same SQL is in db/migration_v2.sql if you prefer to run it
+  // by hand.
+  const columnExists = async (table, column) => Boolean(await one(
+    `SELECT 1 FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+    [table, column]
+  ))
+
+  async function migrate() {
+    try {
+      if (!(await columnExists('meetings', 'access_type'))) {
+        await pool.query("ALTER TABLE meetings ADD COLUMN access_type varchar(20) NOT NULL DEFAULT 'ask'")
+      }
+      if (!(await columnExists('meetings', 'invited_emails'))) {
+        await pool.query('ALTER TABLE meetings ADD COLUMN invited_emails text NULL')
+      }
+      if (!(await columnExists('recordings', 'expires_at'))) {
+        await pool.query('ALTER TABLE recordings ADD COLUMN expires_at datetime(3) NULL, ADD KEY idx_recordings_expires (expires_at)')
+      }
+      await pool.query(`CREATE TABLE IF NOT EXISTS recording_requests (
+        meeting_id varchar(50) NOT NULL,
+        user_id bigint unsigned NOT NULL,
+        name varchar(100) NOT NULL,
+        requested_at datetime(3) NOT NULL,
+        status varchar(20) NOT NULL DEFAULT 'pending',
+        PRIMARY KEY (meeting_id, user_id),
+        KEY idx_recording_requests_status (meeting_id, status),
+        CONSTRAINT fk_recording_requests_meeting FOREIGN KEY (meeting_id) REFERENCES meetings (id) ON DELETE CASCADE,
+        CONSTRAINT fk_recording_requests_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`)
+    } catch (error) {
+      throw new Error(`Could not upgrade the database automatically (${error.message}). Run backend/db/migration_v2.sql once with a user that may alter tables.`)
+    }
+  }
+
   return {
     mode: 'mysql',
     async init() {
@@ -285,6 +390,7 @@ async function createMysqlStore() {
       if (Number(row.tables_found) < 7) {
         throw new Error(`Expected 7 CloudMeet tables, found ${row.tables_found}. Run backend/db/schema.sql first.`)
       }
+      await migrate()
     },
 
     // ---- users ----
@@ -318,14 +424,14 @@ async function createMysqlStore() {
     },
 
     // ---- meetings ----
-    async createMeeting({ title, host_user_id, host_name }) {
+    async createMeeting({ title, host_user_id, host_name, access_type = 'ask', invited_emails = [] }) {
       for (let attempt = 0; attempt < 5; attempt++) {
         const id = newMeetingCode()
         try {
           await run(
-            `INSERT INTO meetings (id, title, host_user_id, host_name, created_at, status)
-             VALUES (?, ?, ?, ?, ?, 'scheduled')`,
-            [id, title, host_user_id, host_name, new Date()]
+            `INSERT INTO meetings (id, title, host_user_id, host_name, created_at, status, access_type, invited_emails)
+             VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?)`,
+            [id, title, host_user_id, host_name, new Date(), access_type, JSON.stringify(invited_emails)]
           )
           return this.getMeeting(id)
         } catch (error) {
@@ -336,7 +442,7 @@ async function createMysqlStore() {
     },
     async getMeeting(code) {
       return meetingRow(await one(
-        'SELECT id, title, host_user_id, host_name, created_at, status FROM meetings WHERE id = ?',
+        'SELECT id, title, host_user_id, host_name, created_at, status, access_type, invited_emails FROM meetings WHERE id = ?',
         [code]
       ))
     },
@@ -425,10 +531,10 @@ async function createMysqlStore() {
     async createRecording(r) {
       await run(
         `INSERT INTO recordings
-           (id, title, room, filename, size, duration_seconds, created_at, host_id, host_name, storage, gcs_object)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, title, room, filename, size, duration_seconds, created_at, host_id, host_name, storage, gcs_object, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [r.id, r.title, r.room, r.filename, r.size, r.duration_seconds, new Date(r.created_at),
-          r.host_id, r.host_name, r.storage, r.gcs_object || null]
+          r.host_id, r.host_name, r.storage, r.gcs_object || null, r.expires_at ? new Date(r.expires_at) : null]
       )
     },
     async recordView(recordingId, userId, name) {
@@ -454,6 +560,55 @@ async function createMysqlStore() {
     },
     async deleteRecording(id) {
       await run('DELETE FROM recordings WHERE id = ?', [id]) // views are removed by ON DELETE CASCADE
+    },
+
+    async listExpiredRecordings(now = new Date()) {
+      const rows = await all(
+        'SELECT * FROM recordings WHERE expires_at IS NOT NULL AND expires_at <= ?',
+        [now]
+      )
+      return rows.map(recordingRow)
+    },
+
+    // ---- recording access requests (the host decides) ----
+    async addRecordingRequest(code, userId, name) {
+      const meeting = await this.getMeeting(code)
+      if (!meeting) return null
+      const allowed = (await attended(code, userId)) || Boolean(await one(
+        'SELECT 1 FROM meeting_viewers WHERE meeting_id = ? AND user_id = ?',
+        [code, userId]
+      ))
+      if (allowed) return { meeting, status: 'approved' }
+      await run(
+        `INSERT INTO recording_requests (meeting_id, user_id, name, requested_at, status)
+         VALUES (?, ?, ?, ?, 'pending')
+         ON DUPLICATE KEY UPDATE name = VALUES(name), requested_at = VALUES(requested_at), status = 'pending'`,
+        [code, userId, name, new Date()]
+      )
+      return { meeting, status: 'pending' }
+    },
+    async listRecordingRequests(hostId) {
+      return all(
+        `SELECT r.meeting_id, m.title, r.user_id, r.name, r.requested_at
+         FROM recording_requests r JOIN meetings m ON m.id = r.meeting_id
+         WHERE m.host_user_id = ? AND r.status = 'pending'
+         ORDER BY r.requested_at`,
+        [hostId]
+      )
+    },
+    async resolveRecordingRequest(code, userId, hostId, approve) {
+      const meeting = await this.getMeeting(code)
+      if (!meeting || meeting.host_user_id !== hostId) return false
+      const result = await run(
+        `UPDATE recording_requests SET status = ?
+         WHERE meeting_id = ? AND user_id = ? AND status = 'pending'`,
+        [approve ? 'approved' : 'denied', code, userId]
+      )
+      if (!result.affectedRows) return false
+      if (approve) {
+        await run('INSERT IGNORE INTO meeting_viewers (meeting_id, user_id) VALUES (?, ?)', [code, userId])
+      }
+      return true
     },
 
     async close() { await pool.end() }

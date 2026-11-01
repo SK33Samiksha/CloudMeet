@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS `meetings` (
   `host_name` varchar(100) NOT NULL,
   `created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   `status` varchar(30) NOT NULL DEFAULT 'active',
+  `access_type` varchar(20) NOT NULL DEFAULT 'ask',
+  `invited_emails` text DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_meetings_host` (`host_user_id`),
   KEY `idx_meetings_created` (`created_at`),
@@ -74,7 +76,9 @@ CREATE TABLE IF NOT EXISTS `recordings` (
   `host_name` varchar(100) NOT NULL,
   `storage` varchar(30) NOT NULL DEFAULT 'local',
   `gcs_object` varchar(1024) DEFAULT NULL,
+  `expires_at` datetime(3) DEFAULT NULL,
   PRIMARY KEY (`id`),
+  KEY `idx_recordings_expires` (`expires_at`),
   KEY `idx_recordings_room` (`room`),
   KEY `idx_recordings_host` (`host_id`),
   KEY `idx_recordings_created` (`created_at`),
@@ -94,4 +98,19 @@ CREATE TABLE IF NOT EXISTS `recording_views` (
   KEY `idx_recording_views_recording_user` (`recording_id`,`user_id`),
   CONSTRAINT `fk_recording_views_recording` FOREIGN KEY (`recording_id`) REFERENCES `recordings` (`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_recording_views_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Version 2: the host decides who may watch a meeting's recordings.
+-- Someone who only knows the meeting code sends a request; it stays 'pending'
+-- until the host approves it (then they are added to meeting_viewers).
+CREATE TABLE IF NOT EXISTS `recording_requests` (
+  `meeting_id` varchar(50) NOT NULL,
+  `user_id` bigint unsigned NOT NULL,
+  `name` varchar(100) NOT NULL,
+  `requested_at` datetime(3) NOT NULL,
+  `status` varchar(20) NOT NULL DEFAULT 'pending',
+  PRIMARY KEY (`meeting_id`,`user_id`),
+  KEY `idx_recording_requests_status` (`meeting_id`,`status`),
+  CONSTRAINT `fk_recording_requests_meeting` FOREIGN KEY (`meeting_id`) REFERENCES `meetings` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_recording_requests_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
