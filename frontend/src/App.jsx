@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
+import { Room, RoomEvent, Track } from 'livekit-client'
 import {
   Video, VideoOff, Mic, MicOff, MonitorUp, MessageCircle, Users,
   Copy, Plus, ArrowRight, PhoneOff, ShieldCheck, Cloud, X, Send,
@@ -390,6 +391,13 @@ export default function App() {
   const joinInfoRef = useRef(null)
   const selfIdRef = useRef(null)
   const participantsRef = useRef([])
+  // Media server (LiveKit). 'p2p' = direct connections between browsers, 'livekit' = media server.
+  // The backend decides, and tells us in the 'room-state' message.
+  const mediaModeRef = useRef('p2p')
+  const lkRoomRef = useRef(null)
+  const lkTracksRef = useRef({})
+  const screenPubRef = useRef(null)
+  const [lkState, setLkState] = useState('off')
   useEffect(() => { participantsRef.current = participants }, [participants])
 
   // Opened an invite link? Scroll to the join card on the home screen.
@@ -417,11 +425,13 @@ export default function App() {
     delete peersRef.current[id]
     delete pendingCandidatesRef.current[id]
     delete remoteStreamsRef.current[id]
+    delete lkTracksRef.current[id]
     setRemoteStreams({ ...remoteStreamsRef.current })
     setPeerStates(prev => { const next = { ...prev }; delete next[id]; return next })
   }
 
   function removeAllPeers() {
+    disconnectLivekit()
     Object.keys(peersRef.current).forEach(removePeer)
     peersRef.current = {}; pendingCandidatesRef.current = {}; remoteStreamsRef.current = {}
     setRemoteStreams({}); setPeerStates({})
@@ -489,6 +499,8 @@ export default function App() {
     socket.on('waiting-for-host', () => setWaitingForHost(true))
     socket.on('join-denied', () => abortMeeting('The host did not let you into the meeting.'))
     socket.on('removed-from-meeting', () => abortMeeting('The host removed you from the meeting.'))
+    // Ticket for the media server. The backend sends it only after the host has let us in.
+    socket.on('livekit-token', payload => connectLivekit(payload))
     socket.on('join-requests', list => {
       const next = Array.isArray(list) ? list : []
       const known = joinRequestIdsRef.current
@@ -499,6 +511,7 @@ export default function App() {
     })
     socket.on('room-state', state => {
       setWaitingForHost(false)
+      if (state.media) mediaModeRef.current = state.media
       if (state.accessType) setMeetingAccess(state.accessType)
       if (state.selfId) selfIdRef.current = state.selfId
       if (state.title) setMeetingTitle(state.title)
@@ -509,7 +522,8 @@ export default function App() {
       // The server sends everyone already in this room to the newly joined user.
       // The new user starts (offers) a WebRTC connection to each of them.
       setParticipants(users)
-      for (const user of users) await createPeer(user.id, true)
+      // With the media server there are no direct connections to build.
+      if (mediaModeRef.current !== 'livekit') for (const user of users) await createPeer(user.id, true)
     })
     socket.on('user-joined', async user => {
       setParticipants(prev => prev.some(p => p.id === user.id)
@@ -517,7 +531,7 @@ export default function App() {
         : [...prev, user])
       flash(`${user.name} joined the meeting`, 3000)
       // Wait for their offer; create the connection now so tracks are ready.
-      await createPeer(user.id, false)
+      if (mediaModeRef.current !== 'livekit') await createPeer(user.id, false)
     })
     socket.on('media-state', user => {
       setParticipants(prev => prev.map(p => p.id === user.id ? { ...p, ...user } : p))
@@ -529,6 +543,7 @@ export default function App() {
       setParticipants(prev => prev.filter(p => p.id !== id))
     })
     socket.on('signal', async ({ from, data }) => {
+      if (mediaModeRef.current === 'livekit') return
       let pc = peersRef.current[from]
       if (!pc) pc = await createPeer(from, false)
       try {
@@ -559,6 +574,102 @@ export default function App() {
       streamRef.current?.getTracks().forEach(t => t.stop())
     }
   }, [])
+
+  // ---------------------------------------------------------------
+  // LIVEKIT MEDIA SERVER (used when the backend says media = 'livekit')
+  // Everyone sends their camera, microphone and shared screen to the media
+  // server once, and the server sends them on to the others. The tiles still
+  // get one MediaStream per person, so the rest of the page (tiles, recording,
+  // zoom) works the same as with direct connections.
+  // ---------------------------------------------------------------
+  function disconnectLivekit() {
+    const lk = lkRoomRef.current
+    lkRoomRef.current = null
+    lkTracksRef.current = {}
+    screenPubRef.current = null
+    // false = keep our own camera and microphone running (the caller decides when to stop them)
+    if (lk) { try { lk.disconnect(false) } catch { /* already closed */ } }
+    setLkState('off')
+  }
+
+  // One stream per person: their microphone, and their shared screen if they have
+  // one, otherwise their camera.
+  function rebuildLivekitStream(id) {
+    const tracks = lkTracksRef.current[id] || {}
+    const list = [tracks.mic, tracks.screen || tracks.camera].filter(Boolean)
+    if (list.length) remoteStreamsRef.current[id] = new MediaStream(list)
+    else delete remoteStreamsRef.current[id]
+    setRemoteStreams({ ...remoteStreamsRef.current })
+  }
+
+  function livekitTrackChanged(id, source, mediaTrack) {
+    const key = source === Track.Source.Microphone ? 'mic'
+      : source === Track.Source.ScreenShare ? 'screen'
+      : source === Track.Source.Camera ? 'camera' : null
+    if (!key) return
+    const tracks = (lkTracksRef.current[id] ||= {})
+    if (mediaTrack) tracks[key] = mediaTrack
+    else delete tracks[key]
+    rebuildLivekitStream(id)
+  }
+
+  // Shared screens are sent in full detail (this is what makes zooming useful).
+  async function publishScreenToLivekit(track) {
+    const lk = lkRoomRef.current
+    if (!lk) return
+    try { track.contentHint = 'detail' } catch { /* not supported */ }
+    screenPubRef.current = await lk.localParticipant.publishTrack(track, {
+      source: Track.Source.ScreenShare,
+      simulcast: false,
+      videoEncoding: { maxBitrate: 4000000, maxFramerate: 15 }
+    })
+  }
+
+  async function connectLivekit(payload) {
+    if (!payload?.token) {
+      setLkState('failed')
+      flash(payload?.error || 'Could not get permission to use the video server.', 8000)
+      return
+    }
+    disconnectLivekit()
+    setLkState('connecting')
+    const lk = new Room()
+    lkRoomRef.current = lk
+    const current = () => lkRoomRef.current === lk
+    lk.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      if (current()) livekitTrackChanged(participant.identity, publication.source, track.mediaStreamTrack)
+    })
+    lk.on(RoomEvent.TrackUnsubscribed, (_track, publication, participant) => {
+      if (current()) livekitTrackChanged(participant.identity, publication.source, null)
+    })
+    lk.on(RoomEvent.ParticipantDisconnected, participant => {
+      if (!current()) return
+      delete lkTracksRef.current[participant.identity]
+      rebuildLivekitStream(participant.identity)
+    })
+    lk.on(RoomEvent.Disconnected, () => {
+      if (!current()) return
+      setLkState('failed')
+      flash('Disconnected from the video server. Leave and join again to reconnect.', 8000)
+    })
+    try {
+      await lk.connect(payload.url, payload.token)
+      if (!current()) { lk.disconnect(false); return }
+      setLkState('connected')
+      // Send what we already have: microphone, camera and (if sharing) the screen.
+      for (const track of streamRef.current?.getTracks() || []) {
+        await lk.localParticipant.publishTrack(track, { source: track.kind === 'audio' ? Track.Source.Microphone : Track.Source.Camera })
+      }
+      const screenTrack = screenStreamRef.current?.getVideoTracks()[0]
+      if (screenTrack) await publishScreenToLivekit(screenTrack)
+    } catch (err) {
+      console.error('LiveKit connection failed:', err)
+      if (current()) {
+        setLkState('failed')
+        flash(`Could not connect to the video server (${err?.message || 'unknown error'}).`, 9000)
+      }
+    }
+  }
 
   async function sendOffer(peerId, pc, options) {
     const offer = await pc.createOffer(options)
@@ -1047,6 +1158,7 @@ export default function App() {
     setRoomRecording(false)
     setParticipants([])
     removeAllPeers()
+    mediaModeRef.current = 'p2p'
     const cleanName = name.trim() || 'Guest'
     setName(cleanName)
     localStorage.setItem('cloudmeet-name', cleanName)
@@ -1144,6 +1256,14 @@ export default function App() {
       try { screenTrack.contentHint = 'detail' } catch {}
       screenStreamRef.current = display
       setScreenStream(display)
+      // With the media server, the screen is published as its own track.
+      if (mediaModeRef.current === 'livekit') {
+        screenTrack.onended = () => stopScreenShare()
+        try { await publishScreenToLivekit(screenTrack) } catch (error) { console.warn('Could not publish the screen:', error) }
+        sendMediaState()
+        flash('You are presenting your screen to everyone.', 4500)
+        return
+      }
       let sent = 0
       for (const [peerId, pc] of Object.entries(peersRef.current)) {
         try {
@@ -1171,6 +1291,11 @@ export default function App() {
   async function stopScreenShare() {
     const display = screenStreamRef.current
     if (!display) return
+    if (mediaModeRef.current === 'livekit') {
+      const published = screenPubRef.current
+      screenPubRef.current = null
+      try { if (published?.track) await lkRoomRef.current?.localParticipant.unpublishTrack(published.track, false) } catch (error) { console.warn('Could not stop the shared screen:', error) }
+    }
     const screenTrack = display.getVideoTracks()[0]
     const cameraTrack = streamRef.current?.getVideoTracks()[0] || null
     await Promise.all(Object.values(peersRef.current).map(async pc => {
@@ -1261,6 +1386,11 @@ export default function App() {
       closed: 'Disconnected'
     }[peerStates[id]] || 'Joined')
     const tileStatus = (id, stream) => {
+      if (mediaModeRef.current === 'livekit') {
+        if (lkState === 'failed') return 'Video connection failed'
+        if (lkState !== 'connected' && !stream) return 'Connecting…'
+        return ''
+      }
       const state = peerStates[id]
       if (state === 'failed') return 'Video connection failed'
       if (state === 'disconnected') return 'Reconnecting…'

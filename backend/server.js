@@ -219,6 +219,54 @@ function cleanCode(value) {
 
 const MAX_CHAT_HISTORY = 100
 
+// LIVEKIT MEDIA SERVER (second VM)
+// When LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET are set in .env,
+// video, audio and screen sharing go through the LiveKit media server (SFU)
+// instead of directly between the browsers. Without them the app keeps using
+// the direct (peer-to-peer) connection, so removing those three lines is
+// the "off switch".
+// The API secret stays on this server. A browser only receives a short-lived
+// ticket (token), and only AFTER the host has let that person into the meeting,
+// so nobody in the waiting room can reach the media server.
+let livekitSdk = null
+if (process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET) {
+  try {
+    livekitSdk = await import('livekit-server-sdk')
+  } catch (error) {
+    console.error('LiveKit is configured, but the package "livekit-server-sdk" is missing.')
+    console.error('Run "npm install" in the backend folder. Using direct (peer-to-peer) video for now.')
+  }
+}
+const livekitEnabled = Boolean(livekitSdk)
+
+// One ticket per person per join. The ticket only works for this meeting's room,
+// and it is only checked when connecting, so it is kept short.
+async function createLivekitToken({ room, identity, name }) {
+  const token = new livekitSdk.AccessToken(
+    process.env.LIVEKIT_API_KEY,
+    process.env.LIVEKIT_API_SECRET,
+    { identity, name, ttl: '15m' }
+  )
+  token.addGrant({ roomJoin: true, room, canPublish: true, canSubscribe: true })
+  return await token.toJwt()
+}
+
+// When the host removes someone, also disconnect them from the media server.
+async function removeFromLivekit(room, identity) {
+  if (!livekitEnabled) return
+  try {
+    const httpUrl = process.env.LIVEKIT_URL.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:')
+    const client = new livekitSdk.RoomServiceClient(
+      httpUrl,
+      process.env.LIVEKIT_API_KEY,
+      process.env.LIVEKIT_API_SECRET
+    )
+    await client.removeParticipant(room, identity)
+  } catch (error) {
+    console.warn('Could not remove the person from the media server:', error.message)
+  }
+}
+
 // Recordings are deleted automatically this many days after they are made.
 // Set RECORDING_RETENTION_DAYS=0 in backend/.env to keep them forever.
 const configuredDays = Number(process.env.RECORDING_RETENTION_DAYS)
@@ -256,7 +304,8 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     recordings: cloudStorageEnabled ? 'cloud-storage' : 'local-disk',
-    database: store?.mode === 'mysql' ? 'cloud-sql' : 'json-files'
+    database: store?.mode === 'mysql' ? 'cloud-sql' : 'json-files',
+    video: livekitEnabled ? 'livekit-media-server' : 'peer-to-peer'
   })
 })
 
@@ -1058,9 +1107,26 @@ async function enterRoom(socket, { room, meeting, account, name, payload }) {
   const attendanceId = randomBytes(8).toString('hex')
   socket.data.attendanceId = attendanceId
 
-  socket.emit('room-state', { ...roomState(room), selfId: socket.id })
+  socket.emit('room-state', {
+    ...roomState(room),
+    selfId: socket.id,
+    // Tells the browser how to send video: 'livekit' (media server) or 'p2p' (direct).
+    media: livekitEnabled ? 'livekit' : 'p2p'
+  })
   socket.emit('room-users', existingUsers)
   socket.to(room).emit('user-joined', publicUser(socket.id, user))
+
+  // Only people who got this far (the host, or a guest the host admitted)
+  // receive a ticket for the media server.
+  if (livekitEnabled) {
+    try {
+      const token = await createLivekitToken({ room, identity: socket.id, name })
+      socket.emit('livekit-token', { url: process.env.LIVEKIT_URL, token })
+    } catch (tokenError) {
+      console.error('Could not create a LiveKit token:', tokenError.message)
+      socket.emit('livekit-token', { error: 'The video server did not give permission to join.' })
+    }
+  }
 
   // The host also receives the list of people already waiting.
   if (isHostAccount) socket.emit('join-requests', pendingList(room))
@@ -1252,6 +1318,7 @@ io.on('connection', socket => {
     roomAdmitted.get(room)?.delete(target.data.userId)
     leaveRoom(target, room)
     target.emit('removed-from-meeting')
+    removeFromLivekit(room, target.id)
   })
 
   // Microphone / camera / screen-share status, shown to everyone.
@@ -1380,6 +1447,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(cloudStorageEnabled
     ? `Recordings: Google Cloud Storage bucket "${cloudStorageBucket}"`
     : 'Recordings: local disk (set GCS_BUCKET to use Cloud Storage)')
+  console.log(livekitEnabled
+    ? `Video: LiveKit media server at ${process.env.LIVEKIT_URL}`
+    : 'Video: direct peer-to-peer (set LIVEKIT_* in .env to use the media server)')
   console.log(RETENTION_DAYS > 0
     ? `Recordings are deleted automatically after ${RETENTION_DAYS} days`
     : 'Recordings are kept forever (RECORDING_RETENTION_DAYS=0)')

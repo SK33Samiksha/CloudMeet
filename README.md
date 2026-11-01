@@ -219,10 +219,11 @@ gcloud storage buckets update gs://YOUR_BUCKET --public-access-prevention
 
 ```bash
 cd ~/CloudMeet && git pull
-cd backend && npm install            # nothing new, safe to run
 # optional: add RECORDING_RETENTION_DAYS=30 to backend/.env
-cd ../frontend && npm install && npm run build   # same build step as before
-sudo systemctl restart cloudmeet
+cd backend && npm install && sudo systemctl restart cloudmeet
+cd ../frontend && npm install && npm run build && sudo cp -r dist/* /var/www/cloudmeet/
+sudo journalctl -u cloudmeet -n 30 --no-pager   # check the start-up log
+curl -s https://34-100-229-5.sslip.io/health
 ```
 
 The first start upgrades the Cloud SQL database automatically (adds the columns
@@ -231,6 +232,46 @@ the table `recording_requests`). If the log says it could not, run
 `backend/db/migration_v2.sql` once with a user that may alter tables.
 Recordings made before the upgrade have no expiry date and are kept until the
 host deletes them (the optional last line of `migration_v2.sql` gives them one).
+
+## Media server (version 3: two VMs)
+
+| Machine | What runs on it |
+|---|---|
+| `cloudmeet-vm` | Website, API, waiting room, chat, recordings (Node.js + Caddy) |
+| `cloudmeet-media` | LiveKit media server (Docker) with Caddy for HTTPS |
+| Cloud SQL / Cloud Storage | Accounts, meetings, recording list / the video files |
+
+**How a meeting works with the media server**
+
+1. A person enters the meeting code and waits in the waiting room (Socket.IO, VM 1).
+2. After the host presses **Admit**, the backend gives that person a short-lived
+   LiveKit *ticket* (token) for that meeting's room only. Nobody in the waiting
+   room gets one, and the API secret never leaves the server.
+3. The browser sends its camera, microphone and shared screen **once** to the media
+   server on VM 2, which sends them on to everyone else. This replaces the old
+   direct browser-to-browser connections and is what makes bigger meetings possible.
+4. Chat, the participants list, the recording indicator and recording itself work
+   as before.
+
+**Switch it on or off** with three lines in `backend/.env` on VM 1:
+
+```
+LIVEKIT_URL=wss://8-231-84-86.sslip.io
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+```
+
+Remove them (and restart the backend) to go back to direct peer-to-peer video.
+`/health` shows which one is active (`"video": "livekit-media-server"` or `"peer-to-peer"`).
+
+**Deploy (VM 1)**
+
+```bash
+cd ~/CloudMeet && git pull
+cd backend && npm install && sudo systemctl restart cloudmeet
+cd ../frontend && npm install && npm run build && sudo cp -r dist/* /var/www/cloudmeet/
+curl -s https://34-100-229-5.sslip.io/health
+```
 
 ## Security notes
 
